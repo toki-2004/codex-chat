@@ -2,18 +2,23 @@
 
 自托管的 Codex 远程聊天：把本机安装的 Codex CLI 变成一个网页聊天服务。手机、平板、任意电脑在同一局域网（或经端口转发）下用浏览器即可与本机 Codex 对话，使用手感与直接使用 Codex CLI 一致。
 
-## 设计原则：单线会话
+## 设计原则：多对话 + 单线会话
 
-客户端与服务端的 Codex 之间只有**一条会话**，就像直接与 Codex 对话一样：
+每个对话对应一条独立的 Codex 会话（线程），同一时间只有一个对话处于活跃状态，所有设备共享当前活跃对话，就像直接与 Codex 对话一样：
 
-- 任何设备发的消息都进入同一条 Codex 会话（线程），回复实时广播给所有在线设备；
+- 任何设备发的消息都进入当前活跃对话对应的 Codex 会话，回复实时广播给所有在线设备；
+- **可新建/切换/删除对话**：新建对话会开启一条全新的 Codex 线程；删除对话会同时清理对应的本地记录与 Codex 线程；
 - Codex 使用本机默认配置（`~/.codex/config.toml`）运行，自动读取 `~/.codex/skills/` 下的技能（Skill），沿用你的既有使用习惯与偏好；
 - 工作根目录是本机真实项目目录（默认 `D:\pythonitems`），Codex 可读写本机所有项目、文件与环境，与使用何种客户端无关；
 - 会话持久化，服务重启后仍可继续（`codex exec resume` 续聊）。
+- 回复以**打字机流式效果**逐步显示（当前 DeepSeek 提供方整段返回、CLI 无增量事件，故采用客户端渐进显示；代码已兼容未来的 delta 流式事件）。
 
 ## 功能
 
-- **一条 Codex 会话**：多设备共享同一对话上下文，像聊天一样连续追问、让 Codex 动手改本机文件。
+- **多对话管理**：新建、切换、删除对话，每个对话独立上下文与 Codex 线程。
+- **单线会话**：同一时间只有一个活跃对话，多设备共享，像聊天一样连续追问、让 Codex 动手改本机文件。
+- **流式显示**：Codex 回复以打字机效果逐步呈现，不再只是加载动画。
+- **无回复超时**：默认不限制回复时长（`turnTimeoutMs: 0`），长任务不会被中途掐断。
 - **账号登录**：首次启动时创建管理员账号，之后所有使用必须登录；管理员可在界面中添加/删除用户、重置密码，普通用户可自行修改密码。密码以 scrypt 加盐哈希存储，不保存明文。
 - **与 CLI 一致的能力**：读取 Skill、遵循 AGENTS.md/HANDOVER.md 约定、使用 git/gh/node 等本机工具、沿用你的模型与账号配置。
 - **实时同步**：所有设备实时看到消息流与在线设备列表，Codex 忙碌时显示打字指示。
@@ -60,7 +65,7 @@ Windows 下也可直接双击 `start.bat`（可见控制台，关闭窗口即停
 | `sandbox` | `danger-full-access` | Codex 沙箱：`read-only` / `workspace-write` / `danger-full-access` |
 | `bypassApprovals` | `true` | true 时跳过审批直接执行命令（等同 CLI 全自动） |
 | `skipGitRepoCheck` | `true` | 允许在非 git 目录运行 Codex |
-| `turnTimeoutMs` | `900000` | 单轮回复超时（毫秒，默认 15 分钟） |
+| `turnTimeoutMs` | `0` | 单轮回复超时（毫秒）；`0` = 不限制（默认） |
 | `maxMessageLen` | `500` | 单条消息最大长度 |
 | `maxHistory` | `500` | 会话保留最近消息数 |
 | `systemPrompt` | 内置 | 会话首轮注入的系统提示词，可用 `{cwd}`、`{codexHome}` 占位符 |
@@ -69,10 +74,10 @@ Windows 下也可直接双击 `start.bat`（可见控制台，关闭窗口即停
 
 ## 工作原理
 
-1. 任意设备发消息 → 服务端写入会话 JSON 并广播；
-2. 若 Codex 空闲，执行 `codex exec --json -C <cwd> --dangerously-bypass-approvals-and-sandbox`（首次，注入系统提示词 + 消息）或 `codex exec resume <thread_id> --json --dangerously-bypass-approvals-and-sandbox`（续聊，沙箱参数需每次显式重传，否则回落默认只读沙箱）；
-3. 服务端解析 JSONL 事件，`thread.started` 里的 `thread_id` 持久化到 `data/conversation.json`，回复经 Socket.io 广播给所有设备；
-4. 消息严格串行处理（先进先出），保证单线会话不冲突；若续接失败（会话失效）自动重开新线程。
+1. 任意设备发消息 → 写入当前活跃对话的 JSON 并广播（无对话时自动新建）；
+2. 若 Codex 空闲，执行 `codex exec --json -C <cwd> --dangerously-bypass-approvals-and-sandbox`（对话首条，注入系统提示词 + 消息）或 `codex exec resume <thread_id> --json --dangerously-bypass-approvals-and-sandbox`（续聊，沙箱参数需每次显式重传，否则回落默认只读沙箱）；
+3. 服务端解析 JSONL 事件，`thread.started` 里的 `thread_id` 持久化到对应对话（`data/conversations.json`），回复经 Socket.io 广播（带流式标记，前端打字机显示）；
+4. 消息严格串行处理（先进先出）；若续接失败（会话失效）自动为该对话重开新线程。
 
 ## 安全说明
 
@@ -96,7 +101,7 @@ codex-chat/
 ├─ server.js       # 后端全部逻辑（REST + Socket.io + 账号鉴权 + Codex 桥接）
 ├─ index.html      # 前端全部逻辑（单文件）
 ├─ config.json     # 服务配置
-├─ data/           # 运行时数据（不入库）：conversation.json / users.json / sessions.json
+├─ data/           # 运行时数据（不入库）：conversations.json / users.json / sessions.json
 ├─ start.bat       # Windows 启动脚本
 ├─ stop.bat        # Windows 停止脚本
 └─ package.json    # 依赖：express、socket.io

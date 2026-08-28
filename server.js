@@ -46,7 +46,8 @@ const { Server } = require('socket.io');
  * ------------------------------------------------------------------------- */
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
-const CONV_FILE = path.join(DATA_DIR, 'conversation.json');
+const CONVS_FILE = path.join(DATA_DIR, 'conversations.json');
+const LEGACY_CONV_FILE = path.join(DATA_DIR, 'conversation.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const PID_FILE = path.join(ROOT, 'server.pid');
@@ -59,7 +60,7 @@ const DEFAULT_CONFIG = {
   sandbox: 'danger-full-access',
   bypassApprovals: true,
   skipGitRepoCheck: true,
-  turnTimeoutMs: 15 * 60 * 1000,
+  turnTimeoutMs: 0, // 0 = 不限制回复时长
   maxMessageLen: 500,
   maxHistory: 500,
   systemPrompt:
@@ -84,10 +85,11 @@ const HOST = process.env.HOST || config.host || '0.0.0.0';
 const CWD = path.resolve(String(config.cwd || ROOT));
 const MAX_MESSAGE_LEN = Number(config.maxMessageLen) || 500;
 const MAX_HISTORY = Number(config.maxHistory) || 500;
-const TURN_TIMEOUT = Number(config.turnTimeoutMs) || 15 * 60 * 1000;
+const TURN_TIMEOUT = Number(config.turnTimeoutMs) || 0; // 0 = 不限制回复时长
 const MAX_AGENT_TEXT = 20000; // 单条 Codex 回复上限，防止文件无限膨胀
 const SEND_HISTORY = 200;     // 客户端可拉取的最近消息数
 const SESSION_TTL = 7 * 24 * 3600 * 1000; // 登录会话有效期（7 天）
+const MAX_CONVERSATIONS = 50; // 对话数量上限，超出时自动删除最旧的
 const AGENT_USER = { userId: 'codex', name: 'Codex', color: '#10a37f' };
 const SYSTEM_USER = { userId: 'system', name: '系统', color: '#8a8f98' };
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -231,31 +233,139 @@ function validPassword(pw) {
 }
 
 /* ---------------------------------------------------------------------------
- * 会话数据（data/conversation.json）：{ sessionId, messages: [...] }
+ * 对话数据（data/conversations.json）：
+ * { activeId, conversations: [{ id, sessionId, title, createdAt, updatedAt, messages }] }
+ * 旧版单会话 data/conversation.json 首次启动自动迁移。
  * ------------------------------------------------------------------------- */
-let conversation = null;
+let conversationsData = null;
 
-function getConversation() {
-  if (!conversation) {
-    conversation = readJSON(CONV_FILE, { sessionId: null, messages: [] });
-    if (!conversation.messages || !Array.isArray(conversation.messages)) conversation.messages = [];
-    conversation.messages = conversation.messages.filter((m) => m && m.text != null);
-    if (!conversation.sessionId) conversation.sessionId = null;
+function getConversations() {
+  if (!conversationsData) {
+    conversationsData = readJSON(CONVS_FILE, null);
+    if (!conversationsData || !Array.isArray(conversationsData.conversations)) {
+      conversationsData = { activeId: null, conversations: [] };
+      const legacy = readJSON(LEGACY_CONV_FILE, null);
+      if (legacy && Array.isArray(legacy.messages)) {
+        const conv = {
+          id: newId('c'),
+          sessionId: legacy.sessionId || null,
+          title: '对话 1',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          messages: legacy.messages.filter((m) => m && m.text != null),
+        };
+        conversationsData.conversations.push(conv);
+        conversationsData.activeId = conv.id;
+        try { fs.renameSync(LEGACY_CONV_FILE, LEGACY_CONV_FILE + '.bak'); } catch (e) { /* 忽略 */ }
+      }
+    }
+    conversationsData.conversations = conversationsData.conversations.filter(
+      (c) => c && c.id && Array.isArray(c.messages)
+    );
   }
-  return conversation;
+  return conversationsData;
 }
 
-function saveConversation() {
+function saveConversations() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  enqueue('conv', () => writeJSONAtomic(CONV_FILE, getConversation()));
+  enqueue('conv', () => writeJSONAtomic(CONVS_FILE, getConversations()));
+}
+
+function getActiveConversation() {
+  const data = getConversations();
+  return data.conversations.find((c) => c.id === data.activeId) || null;
+}
+
+function convPublic(c) {
+  const data = getConversations();
+  return {
+    id: c.id,
+    title: c.title || '新对话',
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    messageCount: c.messages.length,
+    active: c.id === data.activeId,
+  };
+}
+
+function broadcastConversations() {
+  const data = getConversations();
+  io.emit('conversations', {
+    activeId: data.activeId,
+    conversations: data.conversations.map(convPublic),
+  });
+}
+
+function deleteCodexThread(threadId) {
+  // 尽力清理 Codex 线程，不阻塞也不报错
+  try {
+    const exec = resolveCodexExec();
+    spawn(exec.cmd, exec.prefix.concat(['delete', String(threadId), '--force']), {
+      cwd: ROOT,
+      windowsHide: true,
+      stdio: 'ignore',
+      shell: exec.shell,
+    });
+  } catch (e) { /* 忽略 */ }
+}
+
+function createConversation() {
+  const data = getConversations();
+  const now = Date.now();
+  const conv = {
+    id: newId('c'),
+    sessionId: null,
+    title: '新对话',
+    createdAt: now,
+    updatedAt: now,
+    messages: [],
+  };
+  data.conversations.push(conv);
+  data.activeId = conv.id;
+  if (data.conversations.length > MAX_CONVERSATIONS) {
+    const olds = data.conversations
+      .filter((c) => c.id !== data.activeId)
+      .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
+    while (data.conversations.length > MAX_CONVERSATIONS && olds.length) {
+      const old = olds.shift();
+      const idx = data.conversations.findIndex((c) => c.id === old.id);
+      if (idx >= 0) data.conversations.splice(idx, 1);
+      if (old.sessionId) deleteCodexThread(old.sessionId);
+    }
+  }
+  saveConversations();
+  broadcastConversations();
+  return conv;
+}
+
+function deleteConversation(id) {
+  const data = getConversations();
+  const idx = data.conversations.findIndex((c) => c.id === id);
+  if (idx < 0) return false;
+  const [conv] = data.conversations.splice(idx, 1);
+  if (data.activeId === conv.id) {
+    const rest = [...data.conversations].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    data.activeId = rest.length ? rest[0].id : null;
+  }
+  saveConversations();
+  if (conv.sessionId) deleteCodexThread(conv.sessionId);
+  broadcastConversations();
+  return true;
+}
+
+function pushMessageTo(conv, msg, opts) {
+  if (!conv) return;
+  conv.messages.push(msg);
+  if (conv.messages.length > MAX_HISTORY) conv.messages = conv.messages.slice(-MAX_HISTORY);
+  conv.updatedAt = Date.now();
+  saveConversations();
+  const payload = Object.assign({}, msg, { conversationId: conv.id });
+  if (opts && opts.stream) payload.stream = true;
+  io.emit('chat-message', payload);
 }
 
 function pushMessage(msg) {
-  const conv = getConversation();
-  conv.messages.push(msg);
-  if (conv.messages.length > MAX_HISTORY) conv.messages = conv.messages.slice(-MAX_HISTORY);
-  saveConversation();
-  io.emit('chat-message', msg);
+  pushMessageTo(getActiveConversation(), msg, null);
 }
 
 /* ---------------------------------------------------------------------------
@@ -273,7 +383,8 @@ app.get('/api/health', (req, res) => {
     ok: true,
     uptime: Math.round(process.uptime()),
     cwd: CWD,
-    messages: getConversation().messages.length,
+    conversations: getConversations().conversations.length,
+    messages: (getActiveConversation() || { messages: [] }).messages.length,
     codex: codexInfo,
   });
 });
@@ -413,7 +524,41 @@ app.delete('/api/users/:id', requireAdmin, (req, res) => {
 });
 
 app.get('/api/messages', requireAuth, (req, res) => {
-  res.json({ messages: getConversation().messages.slice(-SEND_HISTORY) });
+  const conv = getActiveConversation();
+  res.json({ messages: conv ? conv.messages.slice(-SEND_HISTORY) : [] });
+});
+
+/* ---------- 多对话：列表 / 新建 / 切换 / 删除 ---------- */
+app.get('/api/conversations', requireAuth, (req, res) => {
+  const data = getConversations();
+  res.json({ activeId: data.activeId, conversations: data.conversations.map(convPublic) });
+});
+
+app.post('/api/conversations', requireAuth, (req, res) => {
+  const conv = createConversation();
+  res.json({ ok: true, conversation: conv });
+});
+
+app.get('/api/conversations/:id', requireAuth, (req, res) => {
+  const data = getConversations();
+  const conv = data.conversations.find((c) => c.id === String(req.params.id || ''));
+  if (!conv) return res.status(404).json({ error: '对话不存在' });
+  data.activeId = conv.id;
+  saveConversations();
+  broadcastConversations();
+  res.json({ ok: true, conversation: conv });
+});
+
+app.delete('/api/conversations/:id', requireAuth, (req, res) => {
+  const id = String(req.params.id || '');
+  const data = getConversations();
+  const target = data.conversations.find((c) => c.id === id);
+  if (!target) return res.status(404).json({ error: '对话不存在' });
+  if (state.busy && data.activeId === id) {
+    return res.status(409).json({ error: '该对话正在回复中，请稍后再删除' });
+  }
+  deleteConversation(id);
+  res.json({ ok: true });
 });
 
 /* ---------------------------------------------------------------------------
@@ -496,6 +641,15 @@ io.on('connection', (socket) => {
     const text = String((payload && payload.text) || '').trim().slice(0, MAX_MESSAGE_LEN);
     if (!text) return doAck({ ok: false, reason: '消息不能为空' });
 
+    let conv = getActiveConversation();
+    if (!conv) conv = createConversation();
+    // 第一条消息自动作为对话标题
+    if (conv.messages.length === 0 && (conv.title === '新对话' || !conv.title)) {
+      conv.title = text.length > 14 ? text.slice(0, 14) + '…' : text;
+      saveConversations();
+      broadcastConversations();
+    }
+
     const msg = {
       id: newId('m'),
       userId: user.id,
@@ -505,9 +659,9 @@ io.on('connection', (socket) => {
       at: Date.now(),
       role: 'user',
     };
-    pushMessage(msg);
+    pushMessageTo(conv, msg, null);
     doAck({ ok: true });
-    enqueueCodexTurn(msg);
+    enqueueCodexTurn(msg, conv.id);
   });
 
   socket.on('disconnect', () => {
@@ -558,9 +712,9 @@ function broadcastCodexStatus(busy) {
   io.emit('codex-status', { busy });
 }
 
-function enqueueCodexTurn(msg) {
+function enqueueCodexTurn(msg, convId) {
   if (state.busy) return; // 已在处理中，消息已入队
-  state.queue.push(msg);
+  state.queue.push({ msg, convId });
   state.busy = true;
   processCodexQueue()
     .catch((e) => {
@@ -578,12 +732,12 @@ async function processCodexQueue() {
     const next = state.queue.shift();
     if (!next) return;
     broadcastCodexStatus(true);
-    await runCodexTurn(next);
+    await runCodexTurn(next.msg, next.convId);
   }
 }
 
-function buildCodexArgs(prompt) {
-  const conv = getConversation();
+function buildCodexArgs(prompt, conv) {
+  conv = conv || getActiveConversation() || createConversation();
   const base = [];
   if (conv.sessionId) {
     base.push('exec', 'resume', conv.sessionId, '--json');
@@ -604,9 +758,12 @@ function buildCodexArgs(prompt) {
   return { args: base, isResume: !!conv.sessionId };
 }
 
-function runCodexTurn(msg) {
+function runCodexTurn(msg, convId) {
   return new Promise((resolve) => {
-    const conv = getConversation();
+    const data = getConversations();
+    const conv = data.conversations.find((c) => c.id === convId)
+      || getActiveConversation()
+      || createConversation();
     const firstTurn = !conv.sessionId;
     let prompt = msg.text;
     if (firstTurn) {
@@ -616,7 +773,7 @@ function runCodexTurn(msg) {
       prompt = sys + '\n\n第一条用户消息：\n' + msg.text;
     }
 
-    const { args, isResume } = buildCodexArgs(prompt);
+    const { args, isResume } = buildCodexArgs(prompt, conv);
     console.log('[codex] ' + (isResume ? 'resume ' + conv.sessionId : '新线程') + ' <- ' + msg.text.slice(0, 60));
 
     const exec = resolveCodexExec();
@@ -640,10 +797,10 @@ function runCodexTurn(msg) {
       clearTimeout(timer);
       if (sessionId && sessionId !== conv.sessionId) {
         conv.sessionId = sessionId;
-        saveConversation();
+        saveConversations();
       }
       if (text) {
-        pushMessage({
+        pushMessageTo(conv, {
           id: newId('m'),
           userId: AGENT_USER.userId,
           name: AGENT_USER.name,
@@ -651,9 +808,9 @@ function runCodexTurn(msg) {
           text: text.slice(0, MAX_AGENT_TEXT),
           at: Date.now(),
           role: 'agent',
-        });
+        }, { stream: true });
       } else if (errorInfo) {
-        pushMessage({
+        pushMessageTo(conv, {
           id: newId('m'),
           userId: SYSTEM_USER.userId,
           name: SYSTEM_USER.name,
@@ -661,16 +818,19 @@ function runCodexTurn(msg) {
           text: errorInfo,
           at: Date.now(),
           role: 'system',
-        });
+        }, null);
       }
       resolve();
     };
 
-    const timer = setTimeout(() => {
-      console.error('[codex] 超时，终止进程');
-      killProcTree(proc);
-      finish(null, 'Codex 回复超时（超过 ' + Math.round(TURN_TIMEOUT / 60000) + ' 分钟），已中断。');
-    }, TURN_TIMEOUT);
+    let timer = null;
+    if (TURN_TIMEOUT > 0) {
+      timer = setTimeout(() => {
+        console.error('[codex] 超时，终止进程');
+        killProcTree(proc);
+        finish(null, 'Codex 回复超时（超过 ' + Math.round(TURN_TIMEOUT / 60000) + ' 分钟），已中断。');
+      }, TURN_TIMEOUT);
+    }
 
     proc.stdout.on('data', (chunk) => {
       stdoutBuf += chunk.toString('utf8');
@@ -709,9 +869,9 @@ function runCodexTurn(msg) {
       if (isResume && code !== 0) {
         console.error('[codex] resume 失败，回退新线程：' + tail);
         conv.sessionId = null;
-        saveConversation();
+        saveConversations();
         resolve();
-        state.queue.unshift(msg); // 放回队首，保持顺序
+        state.queue.unshift({ msg, convId: conv.id }); // 放回队首，保持顺序
         return;
       }
       finish(null, 'Codex 调用失败（退出码 ' + code + '）：' + tail);
@@ -788,8 +948,8 @@ function bootstrap() {
   }
   getUsers();
   loadSessions();
-  getConversation();
-  saveConversation();
+  getConversations();
+  saveConversations();
   probeCodex();
 
   server.listen(PORT, HOST, () => {

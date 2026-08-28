@@ -189,6 +189,28 @@ body {
 .role-tag.admin { background: #fef3e2; color: #b7791f; }
 .empty-hint { text-align: center; color: var(--muted); font-size: 13px; padding: 30px 16px; }
 
+/* ---------- 对话列表 ---------- */
+.conv-new { margin: 10px 14px; width: calc(100% - 28px); }
+.conv-item {
+  display: flex; align-items: center; gap: 8px; padding: 11px 14px;
+  border: none; background: none; width: 100%; cursor: pointer; color: var(--text); text-align: left;
+}
+.conv-item:active { background: var(--bg); }
+.conv-item.active { background: var(--accent-soft); }
+.conv-item .c-info { flex: 1; min-width: 0; }
+.conv-item .c-title { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-item .c-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.conv-item .c-del {
+  border: none; background: none; color: var(--muted); font-size: 14px;
+  cursor: pointer; padding: 4px 7px; border-radius: 8px; flex: none;
+}
+.conv-item .c-del:active { background: var(--bg); color: var(--danger); }
+.stream-caret {
+  display: inline-block; width: 2px; height: 1em; background: var(--agent);
+  vertical-align: -2px; margin-left: 2px; animation: caretBlink .8s infinite;
+}
+@keyframes caretBlink { 0%, 45% { opacity: 1; } 50%, 100% { opacity: 0; } }
+
 /* ---------- 弹窗 ---------- */
 .modal-mask {
   position: fixed; inset: 0; background: rgba(20, 24, 38, .45); z-index: 50;
@@ -272,8 +294,16 @@ body {
   </div>
   <div class="sp-body">
     <button class="menu-item" id="menuUsersBtn">👥 用户管理</button>
+    <button class="menu-item" id="menuConvBtn">💬 对话列表</button>
     <button class="menu-item" id="menuPwBtn">🔑 修改密码</button>
     <button class="menu-item danger" id="menuLogoutBtn">⏻ 退出登录</button>
+  </div>
+</div>
+<div class="side-panel" id="convPanel">
+  <div class="sp-head"><span>对话</span><button class="icon-btn" id="convCloseBtn">✕</button></div>
+  <div class="sp-body">
+    <button class="btn primary conv-new" id="newConvBtn">＋ 新建对话</button>
+    <div id="convList"></div>
   </div>
 </div>
 <div class="side-panel" id="memberPanel">
@@ -341,8 +371,13 @@ async function fetchJSON(url, opts, timeoutMs) {
 /* ================= 全局状态 ================= */
 let account = null;      // 登录账号 {userId, username, displayName, role}
 let messages = [];
+let conversations = [];  // 对话列表 [{id,title,createdAt,updatedAt,messageCount,active}]
+let activeConvId = null; // 服务端当前活跃对话
+let displayedConvId = null; // 本端正在展示的对话
 let codexBusy = false;
 let serverCfg = { cwd: '', model: 'default', sandbox: '', maxMessageLen: 500 };
+let streamTimer = null;  // 流式打字机定时器
+let streamMsgId = null;  // 正在流式显示的 agent 消息 id
 
 const socket = io({ autoConnect: false, transports: ['websocket', 'polling'] });
 
@@ -376,7 +411,7 @@ function msgBubble(m) {
   const color = isAgent ? '#10a37f' : (m.color || '#888888');
   const body = isAgent ? '<div class="bubble">' + renderMarkdown(m.text) + '</div>'
     : '<div class="bubble">' + esc(m.text) + '</div>';
-  return '<div class="msg-row ' + cls + '">'
+  return '<div class="msg-row ' + cls + '" data-mid="' + esc(m.id) + '">'
     + '<div class="msg-meta"><span class="m-name" style="color:' + esc(color) + '">' + esc(name) + '</span>'
     + (isMe ? '<span>(我)</span>' : '') + '<span>' + fmtTime(m.at) + '</span></div>'
     + body + '</div>';
@@ -399,6 +434,175 @@ function mergeMessages(incoming) {
   for (const m of incoming) if (m && m.id && !have.has(m.id)) messages.push(m);
   messages.sort((a, b) => a.at - b.at);
   if (messages.length > MAX_CLIENT_MSGS) messages = messages.slice(-MAX_CLIENT_MSGS);
+}
+
+/* ================= 多对话 ================= */
+async function loadActiveMessages() {
+  try {
+    const data = await fetchJSON('/api/messages', {}, 8000);
+    messages = [];
+    mergeMessages(data.messages);
+    renderChat();
+    scrollToBottom(true);
+  } catch (e) { /* 忽略 */ }
+}
+
+async function loadConversations() {
+  try {
+    const data = await fetchJSON('/api/conversations', {}, 8000);
+    conversations = Array.isArray(data.conversations) ? data.conversations : [];
+    activeConvId = data.activeId || null;
+    if (displayedConvId === null) displayedConvId = activeConvId;
+    renderConvList();
+  } catch (e) { /* 忽略 */ }
+}
+
+function renderConvList() {
+  const el = $('convList');
+  if (!conversations.length) {
+    el.innerHTML = '<div class="empty-hint">暂无对话，点击上方「新建对话」开始</div>';
+    return;
+  }
+  el.innerHTML = conversations.map((c) => {
+    const active = c.id === activeConvId;
+    return '<div class="conv-item ' + (active ? 'active' : '') + '" data-id="' + esc(c.id) + '">'
+      + '<div class="c-info"><div class="c-title">' + esc(c.title || '新对话') + '</div>'
+      + '<div class="c-sub">' + c.messageCount + ' 条消息 · ' + fmtTime(c.updatedAt || c.createdAt) + '</div></div>'
+      + '<button class="c-del" data-del="' + esc(c.id) + '" title="删除对话">✕</button>'
+      + '</div>';
+  }).join('');
+  el.querySelectorAll('.conv-item').forEach((row) => {
+    row.onclick = (e) => {
+      if (e.target.closest('.c-del')) return;
+      switchConversation(row.dataset.id);
+    };
+  });
+  el.querySelectorAll('.c-del').forEach((btn) => {
+    btn.onclick = (e) => { e.stopPropagation(); deleteConversation(btn.dataset.del); };
+  });
+}
+
+async function newConversation() {
+  try {
+    const data = await fetchJSON('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    }, 8000);
+    if (!data.ok || !data.conversation) throw new Error('创建失败');
+    activeConvId = data.conversation.id;
+    displayedConvId = data.conversation.id;
+    conversations.unshift({
+      id: data.conversation.id,
+      title: data.conversation.title || '新对话',
+      createdAt: data.conversation.createdAt,
+      updatedAt: data.conversation.updatedAt,
+      messageCount: 0,
+    });
+    renderConvList();
+    messages = [];
+    renderChat();
+    togglePanel(null, false);
+    $('chatInput').focus();
+    toast('已新建对话');
+  } catch (e) {
+    toast('新建对话失败：' + e.message);
+  }
+}
+
+async function switchConversation(id) {
+  if (id === displayedConvId) { togglePanel(null, false); return; }
+  try {
+    const data = await fetchJSON('/api/conversations/' + encodeURIComponent(id), {}, 8000);
+    if (!data.ok || !data.conversation) throw new Error('切换失败');
+    activeConvId = data.conversation.id;
+    displayedConvId = data.conversation.id;
+    messages = [];
+    mergeMessages(data.conversation.messages || []);
+    renderChat();
+    scrollToBottom(true);
+    renderConvList();
+    togglePanel(null, false);
+  } catch (e) {
+    toast('切换对话失败：' + e.message);
+  }
+}
+
+function deleteConversation(id) {
+  const conv = conversations.find((c) => c.id === id);
+  openModal(
+    '<h3>删除对话</h3><p style="font-size:14px;color:var(--muted);margin:0">确定删除「'
+    + esc((conv && conv.title) || '新对话') + '」吗？对话记录与对应 Codex 线程将被删除。</p>'
+    + '<div class="modal-btns"><button class="btn" id="delConvCancel">取消</button>'
+    + '<button class="btn danger primary" id="delConvOk">删除</button></div>',
+    (box) => {
+      box.querySelector('#delConvCancel').onclick = () => closeModal(null);
+      box.querySelector('#delConvOk').onclick = () => closeModal({ ok: true });
+    }
+  ).then(async (res) => {
+    if (!res || !res.ok) return;
+    try {
+      await fetchJSON('/api/conversations/' + encodeURIComponent(id), { method: 'DELETE' }, 8000);
+      toast('对话已删除');
+      await loadConversations();
+      if (displayedConvId === id) {
+        displayedConvId = activeConvId;
+        messages = [];
+        renderChat();
+        await loadActiveMessages();
+      }
+    } catch (e) {
+      toast('删除失败：' + e.message);
+    }
+  });
+}
+
+/* ================= 流式打字机 ================= */
+function stopStream() {
+  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+  if (streamMsgId) {
+    const m = messages.find((x) => x.id === streamMsgId);
+    streamMsgId = null;
+    if (m) {
+      const row = $('msgList').querySelector('[data-mid="' + m.id + '"]');
+      if (row) {
+        const b = row.querySelector('.bubble');
+        if (b) b.innerHTML = renderMarkdown(m.text || '');
+      }
+    }
+  }
+}
+
+function streamMessage(m) {
+  stopStream();
+  streamMsgId = m.id;
+  const full = String(m.text || '');
+  let i = 0;
+  const step = 2;
+  const interval = 24;
+  const tick = () => {
+    const target = messages.find((x) => x.id === m.id);
+    if (!target || streamMsgId !== m.id) return;
+    i = Math.min(i + step, full.length);
+    const row = $('msgList').querySelector('[data-mid="' + m.id + '"]');
+    if (row) {
+      const b = row.querySelector('.bubble');
+      if (b) b.innerHTML = esc(full.slice(0, i)).replace(/\n/g, '<br>') + '<span class="stream-caret"></span>';
+      scrollToBottom(false);
+    }
+    if (i >= full.length) {
+      streamMsgId = null;
+      streamTimer = null;
+      if (row) {
+        const b = row.querySelector('.bubble');
+        if (b) b.innerHTML = renderMarkdown(full);
+      }
+      scrollToBottom(false);
+      return;
+    }
+    streamTimer = setTimeout(tick, interval);
+  };
+  tick();
 }
 
 /* ================= 登录 / 初始化 ================= */
@@ -461,7 +665,11 @@ async function logout() {
   try { await fetchJSON('/api/logout', { method: 'POST' }); } catch (e) { /* 忽略 */ }
   account = null;
   messages = [];
+  conversations = [];
+  activeConvId = null;
+  displayedConvId = null;
   codexBusy = false;
+  stopStream();
   $('typingRow').classList.add('hidden');
   renderChat();
   socket.disconnect();
@@ -513,6 +721,7 @@ socket.on('connect', async () => {
     renderChat();
     if (data.messages && data.messages.length) scrollToBottom(true);
   } catch (e) { /* 忽略 */ }
+  loadConversations();
 });
 socket.on('disconnect', () => setConn('off'));
 socket.on('connect_error', (err) => {
@@ -536,8 +745,26 @@ socket.on('welcome', (p) => {
 
 socket.on('chat-message', (m) => {
   if (!m || m.text == null) return;
+  if (m.conversationId && m.conversationId !== displayedConvId) return;
   mergeMessages([m]);
   renderChat();
+  if (m.stream) {
+    $('typingRow').classList.add('hidden');
+    streamMessage(m);
+  } else {
+    stopStream();
+  }
+});
+
+socket.on('conversations', (p) => {
+  if (!p) return;
+  conversations = Array.isArray(p.conversations) ? p.conversations : [];
+  activeConvId = p.activeId || null;
+  renderConvList();
+  if (activeConvId !== displayedConvId) {
+    displayedConvId = activeConvId;
+    loadActiveMessages();
+  }
 });
 
 socket.on('codex-status', (p) => {
@@ -570,7 +797,7 @@ function updateFootbar() {
 
 /* ================= 面板 ================= */
 function togglePanel(which, open) {
-  for (const id of ['menuPanel', 'memberPanel', 'usersPanel']) {
+  for (const id of ['menuPanel', 'memberPanel', 'usersPanel', 'convPanel']) {
     $(id).classList.toggle('open', open && id === which);
   }
   $('panelMask').classList.toggle('hidden', !open);
@@ -737,11 +964,14 @@ async function boot() {
   $('sendBtn').onclick = sendChat;
   $('menuBtn').onclick = () => togglePanel('menuPanel', true);
   $('menuCloseBtn').onclick = () => togglePanel(null, false);
+  $('convCloseBtn').onclick = () => togglePanel(null, false);
   $('memberBtn').onclick = () => togglePanel('memberPanel', true);
   $('panelCloseBtn').onclick = () => togglePanel(null, false);
   $('usersCloseBtn').onclick = () => togglePanel(null, false);
   $('panelMask').onclick = () => togglePanel(null, false);
   $('menuUsersBtn').onclick = () => { togglePanel(null, false); openUsersPanel(); };
+  $('menuConvBtn').onclick = () => { togglePanel('convPanel', true); loadConversations(); };
+  $('newConvBtn').onclick = newConversation;
   $('menuPwBtn').onclick = () => { togglePanel(null, false); changeOwnPassword(); };
   $('menuLogoutBtn').onclick = logout;
   $('nuAddBtn').onclick = addUser;
