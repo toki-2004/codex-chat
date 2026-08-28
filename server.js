@@ -790,10 +790,10 @@ function bootstrap() {
   loadSessions();
   getConversation();
   saveConversation();
-  fs.writeFileSync(PID_FILE, String(process.pid), 'utf8');
   probeCodex();
 
   server.listen(PORT, HOST, () => {
+    fs.writeFileSync(PID_FILE, String(process.pid), 'utf8');
     const userCount = Object.keys(getUsers().users).length;
     console.log('------------------------------------------');
     console.log('Codex Chat 已启动（单线会话）');
@@ -807,7 +807,7 @@ function bootstrap() {
   server.on('error', (err) => {
     console.error('启动失败：' + err.message);
     if (err.code === 'EADDRINUSE') {
-      console.error('端口 ' + PORT + ' 被占用，请修改 config.json 中的 port 后重试。');
+      console.error('端口 ' + PORT + ' 已被占用：服务可能已在运行，请先执行 stop.bat 停止后再启动。');
     }
     process.exit(1);
   });
