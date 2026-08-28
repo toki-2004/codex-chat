@@ -47,6 +47,8 @@ const { Server } = require('socket.io');
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 const CONV_FILE = path.join(DATA_DIR, 'conversation.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const PID_FILE = path.join(ROOT, 'server.pid');
 
 const DEFAULT_CONFIG = {
@@ -85,6 +87,7 @@ const MAX_HISTORY = Number(config.maxHistory) || 500;
 const TURN_TIMEOUT = Number(config.turnTimeoutMs) || 15 * 60 * 1000;
 const MAX_AGENT_TEXT = 20000; // 单条 Codex 回复上限，防止文件无限膨胀
 const SEND_HISTORY = 200;     // 客户端可拉取的最近消息数
+const SESSION_TTL = 7 * 24 * 3600 * 1000; // 登录会话有效期（7 天）
 const AGENT_USER = { userId: 'codex', name: 'Codex', color: '#10a37f' };
 const SYSTEM_USER = { userId: 'system', name: '系统', color: '#8a8f98' };
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -119,6 +122,112 @@ function enqueue(key, fn) {
 
 function newId(prefix) {
   return prefix + '_' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex');
+}
+
+/* ---------------------------------------------------------------------------
+ * 账号与登录（data/users.json + data/sessions.json）
+ * 密码用 scrypt 加盐哈希存储，绝不保存明文；会话为随机 token + httpOnly Cookie
+ * ------------------------------------------------------------------------- */
+let usersCache = null;
+let sessions = null;
+
+function getUsers() {
+  if (!usersCache) {
+    usersCache = readJSON(USERS_FILE, { users: {} });
+    if (!usersCache.users || typeof usersCache.users !== 'object') usersCache.users = {};
+  }
+  return usersCache;
+}
+
+function saveUsers() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  writeJSONAtomic(USERS_FILE, getUsers());
+}
+
+function loadSessions() {
+  sessions = readJSON(SESSIONS_FILE, {});
+  if (!sessions || typeof sessions !== 'object') sessions = {};
+  const now = Date.now();
+  let changed = false;
+  for (const k of Object.keys(sessions)) {
+    if (!sessions[k] || sessions[k].expires < now) { delete sessions[k]; changed = true; }
+  }
+  if (changed) saveSessions();
+}
+
+function saveSessions() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  writeJSONAtomic(SESSIONS_FILE, sessions);
+}
+
+function passwordHash(pw) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(pw), salt, 32).toString('hex');
+  return salt + ':' + hash;
+}
+
+function passwordVerify(pw, stored) {
+  const parts = String(stored || '').split(':');
+  if (parts.length !== 2) return false;
+  const salt = parts[0];
+  const hash = Buffer.from(parts[1], 'hex');
+  if (hash.length !== 32) return false;
+  const calc = crypto.scryptSync(String(pw), salt, 32);
+  return crypto.timingSafeEqual(hash, calc);
+}
+
+function findUserByUsername(username) {
+  const name = String(username || '').trim().toLowerCase();
+  if (!name) return null;
+  return Object.values(getUsers().users).find((u) => String(u.username).toLowerCase() === name) || null;
+}
+
+function userPublic(u) {
+  return { id: u.id, username: u.username, displayName: u.displayName || u.username, role: u.role, createdAt: u.createdAt };
+}
+
+function createSession(user) {
+  const token = crypto.randomBytes(24).toString('hex');
+  sessions[token] = {
+    userId: user.id,
+    username: user.username,
+    displayName: user.displayName || user.username,
+    role: user.role,
+    expires: Date.now() + SESSION_TTL,
+  };
+  saveSessions();
+  return token;
+}
+
+function sessionFromRequest(req) {
+  const cookie = String(req.headers.cookie || '');
+  const m = /(?:^|;\s*)cc_session=([^;]+)/.exec(cookie);
+  if (!m) return null;
+  const s = sessions[m[1]];
+  if (!s || s.expires < Date.now()) return null;
+  return s;
+}
+
+function requireAuth(req, res, next) {
+  const s = sessionFromRequest(req);
+  if (!s) return res.status(401).json({ error: '未登录或会话已过期' });
+  req.sessionUser = s;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  requireAuth(req, res, () => {
+    if (req.sessionUser.role !== 'admin') return res.status(403).json({ error: '仅管理员可操作' });
+    next();
+  });
+}
+
+function validUsername(name) {
+  return /^[A-Za-z0-9_\u4e00-\u9fa5]{2,24}$/.test(String(name || '').trim());
+}
+
+function validPassword(pw) {
+  return typeof pw === 'string' && pw.length >= 6 && pw.length <= 64;
 }
 
 /* ---------------------------------------------------------------------------
@@ -169,7 +278,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.get('/api/config', (req, res) => {
+app.get('/api/config', requireAuth, (req, res) => {
   res.json({
     serverName: 'Codex Chat',
     cwd: CWD,
@@ -180,7 +289,130 @@ app.get('/api/config', (req, res) => {
   });
 });
 
-app.get('/api/messages', (req, res) => {
+/* ---------- 账号：首次初始化管理员 / 登录 / 登出 / 当前用户 ---------- */
+app.post('/api/setup', (req, res) => {
+  if (Object.keys(getUsers().users).length > 0) {
+    return res.status(400).json({ error: '系统已初始化，不能重复创建管理员' });
+  }
+  const username = String((req.body && req.body.username) || '').trim();
+  const password = String((req.body && req.body.password) || '');
+  if (!validUsername(username)) return res.status(400).json({ error: '用户名需为 2-24 位中文/字母/数字/下划线' });
+  if (!validPassword(password)) return res.status(400).json({ error: '密码长度需为 6-64 位' });
+  const displayName = String((req.body && req.body.displayName) || '').trim().slice(0, 24) || username;
+  const id = newId('u');
+  const user = {
+    id,
+    username,
+    displayName,
+    passwordHash: passwordHash(password),
+    role: 'admin',
+    createdAt: new Date().toISOString(),
+  };
+  getUsers().users[id] = user;
+  saveUsers();
+  const token = createSession(user);
+  res.cookie('cc_session', token, { httpOnly: true, sameSite: 'lax', path: '/', maxAge: SESSION_TTL });
+  console.log('[auth] 初始化管理员 ' + username);
+  res.json({ ok: true, user: userPublic(user) });
+});
+
+app.post('/api/login', (req, res) => {
+  const username = String((req.body && req.body.username) || '').trim();
+  const password = String((req.body && req.body.password) || '');
+  const user = findUserByUsername(username);
+  if (!user || !passwordVerify(password, user.passwordHash)) {
+    return res.status(401).json({ error: '用户名或密码错误' });
+  }
+  const token = createSession(user);
+  res.cookie('cc_session', token, { httpOnly: true, sameSite: 'lax', path: '/', maxAge: SESSION_TTL });
+  res.json({ ok: true, user: userPublic(user) });
+});
+
+app.post('/api/logout', (req, res) => {
+  const cookie = String(req.headers.cookie || '');
+  const m = /(?:^|;\s*)cc_session=([^;]+)/.exec(cookie);
+  if (m && sessions[m[1]]) {
+    delete sessions[m[1]];
+    saveSessions();
+  }
+  res.clearCookie('cc_session', { path: '/' });
+  res.json({ ok: true });
+});
+
+app.get('/api/me', (req, res) => {
+  const s = sessionFromRequest(req);
+  res.json({
+    needsSetup: Object.keys(getUsers().users).length === 0,
+    user: s ? { ...s, displayName: s.displayName || s.username } : null,
+  });
+});
+
+/* ---------- 用户管理（仅管理员） ---------- */
+app.get('/api/users', requireAdmin, (req, res) => {
+  res.json(Object.values(getUsers().users).map(userPublic));
+});
+
+app.post('/api/users', requireAdmin, (req, res) => {
+  const username = String((req.body && req.body.username) || '').trim();
+  const password = String((req.body && req.body.password) || '');
+  if (!validUsername(username)) return res.status(400).json({ error: '用户名需为 2-24 位中文/字母/数字/下划线' });
+  if (!validPassword(password)) return res.status(400).json({ error: '密码长度需为 6-64 位' });
+  if (findUserByUsername(username)) return res.status(400).json({ error: '用户名已存在' });
+  const displayName = String((req.body && req.body.displayName) || '').trim().slice(0, 24) || username;
+  const id = newId('u');
+  const user = {
+    id,
+    username,
+    displayName,
+    passwordHash: passwordHash(password),
+    role: 'user',
+    createdAt: new Date().toISOString(),
+  };
+  getUsers().users[id] = user;
+  saveUsers();
+  console.log('[auth] 管理员 ' + req.sessionUser.username + ' 创建用户 ' + username);
+  res.json({ ok: true, user: userPublic(user) });
+});
+
+app.patch('/api/users/:id', requireAuth, (req, res) => {
+  const target = getUsers().users[String(req.params.id || '')];
+  if (!target) return res.status(404).json({ error: '用户不存在' });
+  const isSelf = req.sessionUser.userId === target.id;
+  const isAdmin = req.sessionUser.role === 'admin';
+  if (!isSelf && !isAdmin) return res.status(403).json({ error: '无权操作该用户' });
+
+  if (req.body.password != null) {
+    if (!validPassword(req.body.password)) return res.status(400).json({ error: '新密码长度需为 6-64 位' });
+    // 本人改密必须验证当前密码；管理员重置他人无需当前密码
+    if (isSelf && !passwordVerify(String(req.body.currentPassword || ''), target.passwordHash)) {
+      return res.status(403).json({ error: '当前密码错误' });
+    }
+    target.passwordHash = passwordHash(req.body.password);
+    console.log('[auth] ' + (isAdmin && !isSelf ? '管理员重置' : '修改') + '用户 ' + target.username + ' 的密码');
+  }
+  if (req.body.displayName != null) {
+    const name = String(req.body.displayName).trim().slice(0, 24);
+    if (name) target.displayName = name;
+  }
+  saveUsers();
+  res.json({ ok: true, user: userPublic(target) });
+});
+
+app.delete('/api/users/:id', requireAdmin, (req, res) => {
+  const target = getUsers().users[String(req.params.id || '')];
+  if (!target) return res.status(404).json({ error: '用户不存在' });
+  if (target.id === req.sessionUser.userId) return res.status(400).json({ error: '不能删除当前登录的管理员' });
+  delete getUsers().users[target.id];
+  saveUsers();
+  // 同步踢出该用户的所有会话
+  for (const k of Object.keys(sessions)) {
+    if (sessions[k].userId === target.id) { delete sessions[k]; saveSessions(); }
+  }
+  console.log('[auth] 管理员 ' + req.sessionUser.username + ' 删除用户 ' + target.username);
+  res.json({ ok: true });
+});
+
+app.get('/api/messages', requireAuth, (req, res) => {
   res.json({ messages: getConversation().messages.slice(-SEND_HISTORY) });
 });
 
@@ -189,6 +421,16 @@ app.get('/api/messages', (req, res) => {
  * ------------------------------------------------------------------------- */
 const server = http.createServer(app);
 const io = new Server(server, { maxHttpBufferSize: 64 * 1024 });
+
+// Socket 鉴权：必须携带有效登录 Cookie，身份取自账号
+io.use((socket, next) => {
+  const cookie = String(socket.handshake.headers.cookie || '');
+  const m = /(?:^|;\s*)cc_session=([^;]+)/.exec(cookie);
+  const s = m && sessions[m[1]];
+  if (!s || s.expires < Date.now()) return next(new Error('unauthorized'));
+  socket.data.account = s;
+  next();
+});
 
 const clients = new Map(); // socketId -> { socketId, userId, name, color, joinedAt }
 
@@ -206,18 +448,25 @@ function broadcastMembers() {
   io.emit('members', memberList());
 }
 
+const USER_COLORS = ['#4c6ef5', '#12b886', '#fa5252', '#f59f00', '#7048e8', '#0ca678', '#e8590c', '#3b5bdb', '#c2255c', '#1098ad'];
+function colorOf(userId) {
+  let h = 0;
+  for (const ch of String(userId)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return USER_COLORS[h % USER_COLORS.length];
+}
+
 io.on('connection', (socket) => {
-  const defaultUser = {
-    id: 'u_' + socket.id.slice(0, 8),
-    name: '匿名设备',
-    color: '#8a8f98',
+  const account = socket.data.account;
+  socket.data.user = {
+    id: account.userId,
+    name: account.displayName || account.username,
+    color: colorOf(account.userId),
   };
-  socket.data.user = defaultUser;
   clients.set(socket.id, {
     socketId: socket.id,
-    userId: defaultUser.id,
-    name: defaultUser.name,
-    color: defaultUser.color,
+    userId: socket.data.user.id,
+    name: socket.data.user.name,
+    color: socket.data.user.color,
     joinedAt: Date.now(),
   });
   broadcastMembers();
@@ -230,14 +479,11 @@ io.on('connection', (socket) => {
 
   socket.on('set-user', (payload, ack) => {
     const doAck = typeof ack === 'function' ? ack : () => {};
-    const id = String((payload && payload.id) || socket.data.user.id).slice(0, 64);
-    const name = String((payload && payload.name) || '匿名设备').slice(0, 24);
-    const color = String((payload && payload.color) || '#8a8f98').slice(0, 16);
-    socket.data.user = { id, name, color };
+    // 身份（名字）固定来自账号，客户端只能改本设备的显示颜色
+    const color = String((payload && payload.color) || socket.data.user.color).slice(0, 16);
+    socket.data.user.color = color;
     const m = clients.get(socket.id);
     if (m) {
-      m.userId = id;
-      m.name = name;
       m.color = color;
     }
     broadcastMembers();
@@ -537,18 +783,22 @@ function bootstrap() {
     console.error('工作目录不存在：' + CWD + '，请在 config.json 中修改 cwd 后重试。');
     process.exit(1);
   }
+  getUsers();
+  loadSessions();
   getConversation();
   saveConversation();
   fs.writeFileSync(PID_FILE, String(process.pid), 'utf8');
   probeCodex();
 
   server.listen(PORT, HOST, () => {
+    const userCount = Object.keys(getUsers().users).length;
     console.log('------------------------------------------');
     console.log('Codex Chat 已启动（单线会话）');
     console.log('本机访问:   http://localhost:' + PORT);
     console.log('局域网访问: http://<本机IP>:' + PORT);
     console.log('工作目录:   ' + CWD);
     console.log('Codex: ' + (codexInfo.ok ? codexInfo.version : '探测中/不可用'));
+    console.log('账号: ' + (userCount ? '已注册 ' + userCount + ' 个账号' : '尚未初始化，请在浏览器打开后创建管理员账号'));
     console.log('------------------------------------------');
   });
   server.on('error', (err) => {
