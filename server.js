@@ -69,6 +69,7 @@ const DEFAULT_CONFIG = {
     '- 可读写本机所有项目、文件与环境（工作根目录 {cwd}），使用本机安装的工具（git、gh、node、npm 等）；\n' +
     '- 自动读取 {codexHome} 下的 skills 技能与配置，沿用用户的既有使用习惯与偏好；\n' +
     '- 涉及项目时先阅读项目根目录的 HANDOVER.md（若存在）。\n' +
+    '- 读取/输出文本文件注意 UTF-8 编码：PowerShell 5.1 会把无 BOM 的 UTF-8 文件当 GBK 读、管道输出默认按 GBK 编码，中文会变成乱码/问号；读取中文文件请用 Get-Content -Encoding UTF8 -Raw 并先设置 [Console]::OutputEncoding=[Text.Encoding]::UTF8，或改用 node/python 读取。\n' +
     '请用与用户相同的语言回复，保持简洁直接。',
 };
 
