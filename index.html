@@ -120,7 +120,8 @@ body {
 .proc-text { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
 .proc-cmd {
   background: #1e2430; color: #e8ecf5; border-radius: 10px;
-  font-family: Consolas, Menlo, monospace; font-size: 12px;
+  font-family: "Cascadia Mono", Consolas, Menlo, "Microsoft YaHei", "PingFang SC", monospace;
+  font-size: 12px; letter-spacing: normal;
 }
 .proc-cmd summary {
   cursor: pointer; padding: 8px 10px; list-style: none; display: flex; gap: 6px; align-items: center;
@@ -425,7 +426,7 @@ function renderProcessHistory(proc) {
   if (!Array.isArray(proc) || !proc.length) return '';
   return '<div class="proc-area">' + proc.map((p) => {
     if (p && p.type === 'cmd') {
-      return '<details class="proc-cmd"><summary><span class="pc-arrow">▸</span><span class="pc-line">$ ' + esc(p.command || '') + '</span></summary>'
+      return '<details class="proc-cmd" open><summary><span class="pc-arrow">▸</span><span class="pc-line">$ ' + esc(p.command || '') + '</span></summary>'
         + '<pre class="proc-out">' + esc(p.output || '') + '</pre>'
         + '<div class="proc-exit">exit code: ' + esc(p.exitCode == null ? '-' : p.exitCode) + '</div></details>';
     }
@@ -448,7 +449,10 @@ function msgBubble(m) {
   const cls = isAgent ? 'agent' : (isMe ? 'me' : 'other');
   const name = isAgent ? 'Codex' : m.name;
   const color = isAgent ? '#10a37f' : (m.color || '#888888');
-  const body = isAgent ? '<div class="bubble">' + renderProcessHistory(m.process) + renderMarkdown(m.text) + '</div>'
+  // 实时收到的消息：过程已在 processArea 持久显示，气泡只放结论；
+  // 历史加载或漏收过程事件的消息：气泡内嵌展开的过程回放
+  const hideLiveProc = m.stream && processBlocks.length > 0;
+  const body = isAgent ? '<div class="bubble">' + (hideLiveProc ? '' : renderProcessHistory(m.process)) + renderMarkdown(m.text) + '</div>'
     : '<div class="bubble">' + esc(m.text) + '</div>';
   return '<div class="msg-row ' + cls + '" data-mid="' + esc(m.id) + '">'
     + '<div class="msg-meta"><span class="m-name" style="color:' + esc(color) + '">' + esc(name) + '</span>'
@@ -798,6 +802,7 @@ socket.on('connect', async () => {
     renderChat();
     if (data.messages && data.messages.length) scrollToBottom(true);
   } catch (e) { /* 忽略 */ }
+  clearProcess(); // 重连后从历史渲染，过程区保持干净
   loadConversations();
 });
 socket.on('disconnect', () => setConn('off'));
@@ -826,7 +831,6 @@ socket.on('chat-message', (m) => {
   mergeMessages([m]);
   renderChat();
   if (m.stream) {
-    clearProcess(); // 回合结束，实时过程并入最终消息的历史回放
     $('typingRow').classList.add('hidden');
     streamMessage(m);
   } else {
@@ -864,6 +868,7 @@ socket.on('conversations', (p) => {
   renderConvList();
   if (activeConvId !== displayedConvId) {
     displayedConvId = activeConvId;
+    clearProcess(); // 切换对话后过程区归零，历史过程在消息气泡内回放
     loadActiveMessages();
   }
 });
