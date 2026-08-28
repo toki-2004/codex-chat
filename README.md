@@ -18,6 +18,7 @@
 - **多对话管理**：新建、切换、删除对话，每个对话独立上下文与 Codex 线程。
 - **单线会话**：同一时间只有一个活跃对话，多设备共享，像聊天一样连续追问、让 Codex 动手改本机文件。
 - **流式显示**：Codex 回复以打字机效果逐步呈现，不再只是加载动画。
+- **执行过程实时可见**：Codex 每执行一条命令都会实时显示命令、输出与退出码，过程文本同步展示，回合结束后可展开回放——不只看到结果，还能看到过程。
 - **无回复超时**：默认不限制回复时长（`turnTimeoutMs: 0`），长任务不会被中途掐断。
 - **账号登录**：首次启动时创建管理员账号，之后所有使用必须登录；管理员可在界面中添加/删除用户、重置密码，普通用户可自行修改密码。密码以 scrypt 加盐哈希存储，不保存明文。
 - **与 CLI 一致的能力**：读取 Skill、遵循 AGENTS.md/HANDOVER.md 约定、使用 git/gh/node 等本机工具、沿用你的模型与账号配置。
@@ -76,7 +77,7 @@ Windows 下也可直接双击 `start.bat`（可见控制台，关闭窗口即停
 
 1. 任意设备发消息 → 写入当前活跃对话的 JSON 并广播（无对话时自动新建）；
 2. 若 Codex 空闲，执行 `codex exec --json -C <cwd> --dangerously-bypass-approvals-and-sandbox`（对话首条，注入系统提示词 + 消息）或 `codex exec resume <thread_id> --json --dangerously-bypass-approvals-and-sandbox`（续聊，沙箱参数需每次显式重传，否则回落默认只读沙箱）；
-3. 服务端解析 JSONL 事件，`thread.started` 里的 `thread_id` 持久化到对应对话（`data/conversations.json`），回复经 Socket.io 广播（带流式标记，前端打字机显示）；
+3. 服务端解析 JSONL 事件：`thread.started` 里的 `thread_id` 持久化到对应对话（`data/conversations.json`）；`command_execution` 命令/输出实时广播 `chat-process` 供前端展示执行过程；回复经 Socket.io 广播（带流式标记与过程回放，前端打字机显示）；
 4. 消息严格串行处理（先进先出）；若续接失败（会话失效）自动为该对话重开新线程。
 
 ## 安全说明

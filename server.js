@@ -90,6 +90,9 @@ const MAX_AGENT_TEXT = 20000; // 单条 Codex 回复上限，防止文件无限�
 const SEND_HISTORY = 200;     // 客户端可拉取的最近消息数
 const SESSION_TTL = 7 * 24 * 3600 * 1000; // 登录会话有效期（7 天）
 const MAX_CONVERSATIONS = 50; // 对话数量上限，超出时自动删除最旧的
+const MAX_PROCESS_ENTRIES = 30;   // 单回合过程记录条数上限
+const MAX_PROCESS_TEXT = 2000;    // 单条过程文本/命令长度上限
+const MAX_PROCESS_OUTPUT = 8000;  // 单条命令输出长度上限
 const AGENT_USER = { userId: 'codex', name: 'Codex', color: '#10a37f' };
 const SYSTEM_USER = { userId: 'system', name: '系统', color: '#8a8f98' };
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -790,6 +793,11 @@ function runCodexTurn(msg, convId) {
     let agentText = '';
     let turnDone = false;
     let sessionId = conv.sessionId || null;
+    const processItems = [];
+    const emitProcess = (payload) => {
+      if (turnDone) return;
+      io.emit('chat-process', Object.assign({ conversationId: conv.id }, payload));
+    };
 
     const finish = (text, errorInfo) => {
       if (turnDone) return;
@@ -800,6 +808,18 @@ function runCodexTurn(msg, convId) {
         saveConversations();
       }
       if (text) {
+        // 去掉与最终回复重复的尾部文本（该文本已作为回复展示）
+        while (processItems.length && processItems[processItems.length - 1].type === 'text'
+          && processItems[processItems.length - 1].text === text) {
+          processItems.pop();
+        }
+        const proc = processItems.slice(-MAX_PROCESS_ENTRIES).map((p) => ({
+          type: p.type,
+          command: p.command != null ? String(p.command).slice(0, MAX_PROCESS_TEXT) : undefined,
+          output: p.output != null ? String(p.output).slice(0, MAX_PROCESS_OUTPUT) : undefined,
+          exitCode: p.exitCode,
+          text: p.text != null ? String(p.text).slice(0, MAX_PROCESS_TEXT) : undefined,
+        }));
         pushMessageTo(conv, {
           id: newId('m'),
           userId: AGENT_USER.userId,
@@ -808,6 +828,7 @@ function runCodexTurn(msg, convId) {
           text: text.slice(0, MAX_AGENT_TEXT),
           at: Date.now(),
           role: 'agent',
+          process: proc.length ? proc : undefined,
         }, { stream: true });
       } else if (errorInfo) {
         pushMessageTo(conv, {
@@ -843,6 +864,21 @@ function runCodexTurn(msg, convId) {
           setSession: (id) => { sessionId = id; },
           addDelta: (t) => { agentText += t; },
           setText: (t) => { agentText = t; },
+          onCommand: (info) => {
+            if (info.status === 'done') {
+              processItems.push({
+                type: 'cmd',
+                command: info.command,
+                output: info.output,
+                exitCode: info.exitCode,
+              });
+            }
+            emitProcess({ type: 'cmd', status: info.status, command: info.command, output: info.output, exitCode: info.exitCode });
+          },
+          onAgentText: (t) => {
+            processItems.push({ type: 'text', text: t });
+            emitProcess({ type: 'text', text: t });
+          },
         });
       }
     });
@@ -896,6 +932,28 @@ function handleCodexEvent(line, ctx) {
     ctx.setText('');
     return;
   }
+  if (type === 'item.started' && ev.item && ev.item.type === 'command_execution') {
+    if (ctx.onCommand) ctx.onCommand({ status: 'start', command: ev.item.command || '' });
+    return;
+  }
+  if (type === 'item.completed' && ev.item && ev.item.type === 'command_execution') {
+    if (ctx.onCommand) ctx.onCommand({
+      status: 'done',
+      command: ev.item.command || '',
+      output: ev.item.aggregated_output || '',
+      exitCode: ev.item.exit_code != null ? ev.item.exit_code : null,
+    });
+    return;
+  }
+  if (type === 'item.completed' && ev.item && ev.item.type === 'function_call') {
+    if (ctx.onCommand) ctx.onCommand({
+      status: 'done',
+      command: String(ev.item.name || '') + (ev.item.arguments ? ' ' + String(ev.item.arguments) : ''),
+      output: ev.item.output || '',
+      exitCode: null,
+    });
+    return;
+  }
   // 兼容多种增量事件形态：{delta} / {params:{delta}} / {item:{delta}}
   if (type.includes('delta')) {
     const d = (ev.params && ev.params.delta) || ev.delta || (ev.item && ev.item.delta);
@@ -903,6 +961,7 @@ function handleCodexEvent(line, ctx) {
     return;
   }
   if (type === 'item.completed' && ev.item && ev.item.type === 'agent_message' && typeof ev.item.text === 'string') {
+    if (ctx.onAgentText) ctx.onAgentText(ev.item.text);
     ctx.setText(ev.item.text);
   }
 }
