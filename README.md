@@ -70,7 +70,7 @@ Windows 下也可直接双击 `start.bat`（可见控制台，关闭窗口即停
 ## 工作原理
 
 1. 任意设备发消息 → 服务端写入会话 JSON 并广播；
-2. 若 Codex 空闲，执行 `codex exec --json -C <cwd>`（首次，注入系统提示词 + 消息）或 `codex exec resume <thread_id> --json`（续聊）；
+2. 若 Codex 空闲，执行 `codex exec --json -C <cwd> --dangerously-bypass-approvals-and-sandbox`（首次，注入系统提示词 + 消息）或 `codex exec resume <thread_id> --json --dangerously-bypass-approvals-and-sandbox`（续聊，沙箱参数需每次显式重传，否则回落默认只读沙箱）；
 3. 服务端解析 JSONL 事件，`thread.started` 里的 `thread_id` 持久化到 `data/conversation.json`，回复经 Socket.io 广播给所有设备；
 4. 消息严格串行处理（先进先出），保证单线会话不冲突；若续接失败（会话失效）自动重开新线程。
 

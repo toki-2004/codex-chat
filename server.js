@@ -587,6 +587,9 @@ function buildCodexArgs(prompt) {
   const base = [];
   if (conv.sessionId) {
     base.push('exec', 'resume', conv.sessionId, '--json');
+    if (config.bypassApprovals) {
+      base.push('--dangerously-bypass-approvals-and-sandbox');
+    }
   } else {
     base.push('exec', '--json', '-C', CWD);
     if (config.bypassApprovals) {
