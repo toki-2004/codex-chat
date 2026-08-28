@@ -1,0 +1,14 @@
+{
+  "name": "codex-chat",
+  "version": "1.0.0",
+  "license": "MIT",
+  "description": "自托管 Codex 远程聊天室：在任何设备上通过浏览器访问本机 Codex",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3"
+  }
+}
