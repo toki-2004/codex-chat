@@ -18,6 +18,8 @@
  *   port / host               监听地址
  *   cwd                       Codex 工作根目录（本机项目根，默认 D:\pythonitems）
  *   model                     Codex 模型（null = 使用 Codex 默认配置）
+ *   profile                   Codex 配置档（-p，叠加 $CODEX_HOME/<name>.config.toml；null = 不使用）
+ *   models                    网页端可切换的模型候选列表
  *   sandbox                   read-only | workspace-write | danger-full-access
  *   bypassApprovals           true = 跳过审批直接执行（等同 CLI 全自动）
  *   skipGitRepoCheck          允许在非 git 目录运行 Codex
@@ -51,12 +53,15 @@ const LEGACY_CONV_FILE = path.join(DATA_DIR, 'conversation.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const PID_FILE = path.join(ROOT, 'server.pid');
+const CONFIG_FILE = path.join(ROOT, 'config.json');
 
 const DEFAULT_CONFIG = {
   port: 3100,
   host: '0.0.0.0',
   cwd: 'D:\\pythonitems',
   model: null,
+  profile: null,
+  models: [],
   sandbox: 'danger-full-access',
   bypassApprovals: true,
   skipGitRepoCheck: true,
@@ -97,6 +102,54 @@ const MAX_PROCESS_OUTPUT = 8000;  // 单条命令输出长度上限
 const AGENT_USER = { userId: 'codex', name: 'Codex', color: '#10a37f' };
 const SYSTEM_USER = { userId: 'system', name: '系统', color: '#8a8f98' };
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const NAME_RE = /^[A-Za-z0-9._\/:-]{1,100}$/;
+
+/* 把当前模型 / API 选择持久化回 config.json（只更新这几个字段，其余保持原样） */
+function saveConfig() {
+  try {
+    let raw = {};
+    try { raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) { /* 不存在则新建 */ }
+    raw.model = config.model;
+    raw.profile = config.profile;
+    raw.models = config.models;
+    writeJSONAtomic(CONFIG_FILE, raw);
+  } catch (e) {
+    console.error('[config] 写入 config.json 失败：' + e.message);
+  }
+}
+
+/* 扫描 $CODEX_HOME/*.config.toml 得到可用配置档（codex -p <name>） */
+function listCodexProfiles() {
+  try {
+    return fs.readdirSync(CODEX_HOME)
+      .filter((f) => f.endsWith('.config.toml'))
+      .map((f) => f.slice(0, -'.config.toml'.length))
+      .filter((n) => n && NAME_RE.test(n));
+  } catch (e) {
+    return [];
+  }
+}
+
+/* 从某个 config 层的 toml 里读 model_catalog_json（如 zcode-models.json / models.json），返回模型列表 */
+function catalogModelsFromToml(tomlPath) {
+  try {
+    const toml = fs.readFileSync(tomlPath, 'utf8');
+    const m = /model_catalog_json\s*=\s*"([^"]+)"/.exec(toml);
+    if (!m) return [];
+    const cat = JSON.parse(fs.readFileSync(m[1], 'utf8'));
+    return (Array.isArray(cat.models) ? cat.models : [])
+      .filter((x) => x && x.slug && x.visibility !== 'hidden')
+      .map((x) => String(x.slug));
+  } catch (e) {
+    return [];
+  }
+}
+
+/* 配置档对应的模型目录；默认配置则读基础 config.toml 的 model_catalog_json */
+function profileCatalogModels(profile) {
+  if (!profile) return catalogModelsFromToml(path.join(CODEX_HOME, 'config.toml'));
+  return catalogModelsFromToml(path.join(CODEX_HOME, profile + '.config.toml'));
+}
 
 /* ---------------------------------------------------------------------------
  * 工具函数：JSON 读写（tmp + rename 原子落盘）、写队列
@@ -397,11 +450,73 @@ app.get('/api/config', requireAuth, (req, res) => {
   res.json({
     serverName: 'Codex Chat',
     cwd: CWD,
+    profile: config.profile || 'default',
     model: config.model || 'default',
     sandbox: config.sandbox,
     bypassApprovals: !!config.bypassApprovals,
     maxMessageLen: MAX_MESSAGE_LEN,
   });
+});
+
+/* ---------- 配置档 / 模型切换 ---------- */
+function normalizeModel(value, list) {
+  const v = value == null || value === '' || value === 'default' ? null : String(value).trim();
+  if (v !== null && !NAME_RE.test(v)) return { error: '名称仅允许字母、数字和 . _ / : -，长度 1-100' };
+  // 配置了候选列表时优先校验（当前已选中的值始终允许）
+  if (v !== null && Array.isArray(list) && list.length > 0
+      && !list.includes(v) && v !== config.model) {
+    return { error: '不在可选列表中：' + v };
+  }
+  return { value: v };
+}
+
+function resolveProfile(value) {
+  const v = value == null || value === '' || value === 'default' ? null : String(value).trim();
+  if (v !== null && !NAME_RE.test(v)) return { error: '配置档名仅允许字母、数字和 . _ / : -' };
+  if (v !== null && !fs.existsSync(path.join(CODEX_HOME, v + '.config.toml'))) {
+    return { error: '配置档不存在：' + CODEX_HOME + '\\' + v + '.config.toml' };
+  }
+  return { value: v };
+}
+
+app.get('/api/model-options', requireAuth, (req, res) => {
+  const profiles = Array.isArray(config.profiles) ? config.profiles.slice() : [];
+  for (const name of listCodexProfiles()) {
+    if (!profiles.includes(name)) profiles.push(name);
+  }
+  if (config.profile && !profiles.includes(config.profile)) profiles.push(config.profile);
+
+  // 当前配置档的模型目录（默认配置读基础 config.toml 的 model_catalog_json）+ config.models 补充
+  const catalogModels = profileCatalogModels(config.profile);
+  const models = catalogModels.slice();
+  for (const m of (Array.isArray(config.models) ? config.models : [])) {
+    if (!models.includes(m)) models.push(m);
+  }
+  if (config.model && !models.includes(config.model)) models.push(config.model);
+  res.json({
+    profile: config.profile || 'default',
+    model: config.model || 'default',
+    profiles,
+    models,
+  });
+});
+
+app.post('/api/model-settings', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const pf = resolveProfile(body.profile);
+  if (pf.error) return res.status(400).json({ error: '配置档：' + pf.error });
+  const m = normalizeModel(body.model, config.models);
+  if (m.error) return res.status(400).json({ error: '模型：' + m.error });
+  config.profile = pf.value;
+  config.model = m.value;
+  saveConfig();
+  const payload = {
+    profile: config.profile || 'default',
+    model: config.model || 'default',
+  };
+  io.emit('model-changed', payload);
+  console.log('[config] 配置档/模型已切换 -> profile=' + payload.profile + ', model=' + payload.model);
+  res.json(Object.assign({ ok: true }, payload));
 });
 
 /* ---------- 账号：首次初始化管理员 / 登录 / 登出 / 当前用户 ---------- */
@@ -621,6 +736,7 @@ io.on('connection', (socket) => {
   broadcastMembers();
   socket.emit('welcome', { config: {
     cwd: CWD,
+    profile: config.profile || 'default',
     model: config.model || 'default',
     sandbox: config.sandbox,
     maxMessageLen: MAX_MESSAGE_LEN,
@@ -717,8 +833,10 @@ function broadcastCodexStatus(busy) {
 }
 
 function enqueueCodexTurn(msg, convId) {
-  if (state.busy) return; // 已在处理中，消息已入队
+  // 总是入队：busy 时由正在运行的 processCodexQueue 循环继续消费，
+  // 修复旧逻辑 busy 时直接 return 导致消息被静默丢弃（不回复、模型收不到）。
   state.queue.push({ msg, convId });
+  if (state.busy) return;
   state.busy = true;
   processCodexQueue()
     .catch((e) => {
@@ -743,13 +861,16 @@ async function processCodexQueue() {
 function buildCodexArgs(prompt, conv) {
   conv = conv || getActiveConversation() || createConversation();
   const base = [];
+  // -p 紧跟 exec（位于 resume 之前），叠加 $CODEX_HOME/<name>.config.toml
+  base.push('exec');
+  if (config.profile) base.push('-p', String(config.profile));
   if (conv.sessionId) {
-    base.push('exec', 'resume', conv.sessionId, '--json');
+    base.push('resume', conv.sessionId, '--json');
     if (config.bypassApprovals) {
       base.push('--dangerously-bypass-approvals-and-sandbox');
     }
   } else {
-    base.push('exec', '--json', '-C', CWD);
+    base.push('--json', '-C', CWD);
     if (config.bypassApprovals) {
       base.push('--dangerously-bypass-approvals-and-sandbox');
     } else {

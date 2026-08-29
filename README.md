@@ -19,8 +19,10 @@
 - **单线会话**：同一时间只有一个活跃对话，多设备共享，像聊天一样连续追问、让 Codex 动手改本机文件。
 - **流式显示**：Codex 回复以打字机效果逐步呈现，不再只是加载动画。
 - **执行过程实时可见**：Codex 每执行一条命令都会实时显示命令、输出与退出码，过程文本同步展示，回合结束后可展开回放——不只看到结果，还能看到过程。
+- **消息排队**：Codex 回复期间发送的消息自动排队，回复完成后依次处理，不会丢失。
 - **无回复超时**：默认不限制回复时长（`turnTimeoutMs: 0`），长任务不会被中途掐断。
 - **账号登录**：首次启动时创建管理员账号，之后所有使用必须登录；管理员可在界面中添加/删除用户、重置密码，普通用户可自行修改密码。密码以 scrypt 加盐哈希存储，不保存明文。
+- **在线切换 API 与模型**：菜单面板中可切换配置档（Profile）与模型，全设备实时同步，选择持久化到 `config.json`，下一轮回复生效。配置档即 `~/.codex/*.config.toml`（如 `codex -p zcode` 叠加的 `zcode.config.toml`），自动扫描发现；模型候选自动读取当前配置的 `model_catalog_json`（默认档读 `~/.codex/config.toml` 指向的 `models.json`，zcode 档读 `zcode-models.json`）。API 完全由配置档决定：默认档沿用 `~/.codex/config.toml`，选 zcode 档即走 BigModel——不修改任何默认配置。
 - **与 CLI 一致的能力**：读取 Skill、遵循 AGENTS.md/HANDOVER.md 约定、使用 git/gh/node 等本机工具、沿用你的模型与账号配置。
 - **实时同步**：所有设备实时看到消息流与在线设备列表，Codex 忙碌时显示打字指示。
 - **移动端优先**：全屏聊天界面，适配手机安全区，无需安装任何 App。
@@ -63,6 +65,9 @@ Windows 下也可直接双击 `start.bat`（可见控制台，关闭窗口即停
 | `host` | `0.0.0.0` | 监听地址（0.0.0.0 允许局域网访问） |
 | `cwd` | `D:\pythonitems` | Codex 工作根目录（本机项目根） |
 | `model` | `null` | Codex 模型名；留空使用 Codex 默认配置 |
+| `profile` | `null` | Codex 配置档名（`-p`，叠加 `~/.codex/<name>.config.toml`）；留空不使用 |
+| `profiles` | `[]` | 网页端"配置档"下拉框的补充候选（自动扫描 `~/.codex/*.config.toml`） |
+| `models` | `[]` | 网页端"模型"下拉框候选列表 |
 | `sandbox` | `danger-full-access` | Codex 沙箱：`read-only` / `workspace-write` / `danger-full-access` |
 | `bypassApprovals` | `true` | true 时跳过审批直接执行命令（等同 CLI 全自动） |
 | `skipGitRepoCheck` | `true` | 允许在非 git 目录运行 Codex |
@@ -72,6 +77,8 @@ Windows 下也可直接双击 `start.bat`（可见控制台，关闭窗口即停
 | `systemPrompt` | 内置 | 会话首轮注入的系统提示词，可用 `{cwd}`、`{codexHome}` 占位符 |
 
 环境变量 `PORT`、`HOST` 可覆盖 `config.json`。
+
+提示：把 `zcode.config.toml` 这类文件放进 `~/.codex/`，网页菜单的"配置档"下拉框即可直接选择，等价于命令行 `codex -p zcode`；在 `config.json` 中预填 `models` 数组可为无模型目录的配置档补充候选。
 
 ## 工作原理
 

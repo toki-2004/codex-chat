@@ -193,6 +193,13 @@ body {
 .menu-account { padding: 14px 16px; border-bottom: 1px solid var(--line); }
 .menu-account .ma-name { font-weight: 700; }
 .menu-account .ma-user { font-size: 12px; color: var(--muted); }
+.model-switch { padding: 12px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 6px; }
+.model-switch label { font-size: 12px; color: var(--muted); }
+.model-switch select {
+  width: 100%; border: 1px solid var(--line); border-radius: 9px;
+  padding: 8px 10px; font-size: 13px; outline: none; background: var(--bg); color: var(--text);
+}
+.model-switch .ms-hint { font-size: 11px; color: var(--muted); line-height: 1.5; margin-top: 2px; }
 
 /* ---------- 用户管理 ---------- */
 .user-add { padding: 12px 14px; border-bottom: 1px solid var(--line); }
@@ -315,6 +322,13 @@ body {
     <div class="ma-name" id="menuName"></div>
     <div class="ma-user" id="menuUsername"></div>
   </div>
+  <div class="model-switch">
+    <label for="profileSel">配置档（API 预设）</label>
+    <select id="profileSel"></select>
+    <label for="modelSel">模型</label>
+    <select id="modelSel"></select>
+    <div class="ms-hint">API 由配置档决定（默认档沿用 ~/.codex/config.toml）；切换后下一轮回复生效</div>
+  </div>
   <div class="sp-body">
     <button class="menu-item" id="menuUsersBtn">👥 用户管理</button>
     <button class="menu-item" id="menuConvBtn">💬 对话列表</button>
@@ -398,7 +412,7 @@ let conversations = [];  // 对话列表 [{id,title,createdAt,updatedAt,messageC
 let activeConvId = null; // 服务端当前活跃对话
 let displayedConvId = null; // 本端正在展示的对话
 let codexBusy = false;
-let serverCfg = { cwd: '', model: 'default', sandbox: '', maxMessageLen: 500 };
+let serverCfg = { cwd: '', profile: 'default', model: 'default', sandbox: '', maxMessageLen: 500 };
 let streamTimer = null;  // 流式打字机定时器
 let streamMsgId = null;  // 正在流式显示的 agent 消息 id
 let processBlocks = [];  // 当前回合实时执行过程块
@@ -825,6 +839,18 @@ socket.on('welcome', (p) => {
   }
 });
 
+socket.on('model-changed', (p) => {
+  if (!p) return;
+  serverCfg.profile = p.profile || 'default';
+  serverCfg.model = p.model || 'default';
+  $('profileSel').value = serverCfg.profile;
+  if ($('profileSel').value !== serverCfg.profile) $('profileSel').value = 'default';
+  $('modelSel').value = serverCfg.model;
+  if ($('modelSel').value !== serverCfg.model) $('modelSel').value = 'default';
+  loadModelOptions();
+  updateFootbar();
+});
+
 socket.on('chat-message', (m) => {
   if (!m || m.text == null) return;
   if (m.conversationId && m.conversationId !== displayedConvId) return;
@@ -896,9 +922,57 @@ function setConn(state) {
 function updateFootbar() {
   const cwd = serverCfg.cwd || '';
   $('footbar').innerHTML = '登录账号：' + esc(account ? (account.displayName || account.username) : '')
+    + ' · 配置 <span class="mono">' + esc(serverCfg.profile || 'default') + '</span>'
     + ' · Codex 模型 <span class="mono">' + esc(serverCfg.model) + '</span>'
     + ' · 沙箱 <span class="mono">' + esc(serverCfg.sandbox) + '</span>'
     + (cwd ? ' · 工作目录 <span class="mono">' + esc(cwd) + '</span>' : '');
+}
+
+/* ================= 模型 / API 切换 ================= */
+function fillSelect(sel, list, current) {
+  const opts = ['<option value="default">默认（Codex 配置）</option>'];
+  for (const item of list || []) {
+    if (item && item !== 'default') opts.push('<option value="' + esc(item) + '">' + esc(item) + '</option>');
+  }
+  if (current && current !== 'default' && !(list || []).includes(current)) {
+    opts.push('<option value="' + esc(current) + '">' + esc(current) + '</option>');
+  }
+  sel.innerHTML = opts.join('');
+  sel.value = current || 'default';
+  if (sel.value !== (current || 'default')) sel.value = 'default';
+}
+
+async function loadModelOptions() {
+  try {
+    const d = await fetchJSON('/api/model-options', {}, 8000);
+    serverCfg.profile = d.profile;
+    serverCfg.model = d.model;
+    fillSelect($('profileSel'), d.profiles, d.profile);
+    fillSelect($('modelSel'), d.models, d.model);
+    updateFootbar();
+  } catch (e) { /* 面板静默失败，不影响聊天 */ }
+}
+
+/* 配置档或模型变化后立即保存；切配置档时模型重置为该档默认 */
+async function saveModelSettings() {
+  try {
+    const d = await fetchJSON('/api/model-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        profile: $('profileSel').value,
+        model: $('modelSel').value,
+      }),
+    }, 8000);
+    serverCfg.profile = d.profile;
+    serverCfg.model = d.model;
+    updateFootbar();
+    toast('已切换：配置档 ' + d.profile + ' · 模型 ' + d.model + '（下一轮回复生效）');
+    await loadModelOptions();
+  } catch (e) {
+    toast('切换失败：' + (e.message || e));
+    loadModelOptions();
+  }
 }
 
 /* ================= 面板 ================= */
@@ -1068,7 +1142,7 @@ async function boot() {
   $('authUser').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuth(); });
 
   $('sendBtn').onclick = sendChat;
-  $('menuBtn').onclick = () => togglePanel('menuPanel', true);
+  $('menuBtn').onclick = () => { togglePanel('menuPanel', true); loadModelOptions(); };
   $('menuCloseBtn').onclick = () => togglePanel(null, false);
   $('convCloseBtn').onclick = () => togglePanel(null, false);
   $('memberBtn').onclick = () => togglePanel('memberPanel', true);
@@ -1081,6 +1155,8 @@ async function boot() {
   $('menuPwBtn').onclick = () => { togglePanel(null, false); changeOwnPassword(); };
   $('menuLogoutBtn').onclick = logout;
   $('nuAddBtn').onclick = addUser;
+  $('modelSel').onchange = saveModelSettings;
+  $('profileSel').onchange = () => { $('modelSel').value = 'default'; saveModelSettings(); };
 
   $('modalMask').addEventListener('click', (e) => {
     if (e.target === $('modalMask')) closeModal(null);
