@@ -5,10 +5,14 @@
   "description": "自托管 Codex 远程聊天室：在任何设备上通过浏览器访问本机 Codex",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test/e2e.js"
   },
   "dependencies": {
     "express": "^5.2.1",
     "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.3"
   }
 }

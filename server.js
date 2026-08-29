@@ -800,6 +800,12 @@ const state = { busy: false, queue: [], proc: null };
 let codexExec = null;
 function resolveCodexExec() {
   if (codexExec) return codexExec;
+  // 测试钩子：CCX_CODEX_JS 指向 codex 替身脚本（node 直接运行、无 shell 包装，
+  // 参数原样传递），供 test/e2e.js 离线端到端测试使用；不设置时行为不变。
+  if (process.env.CCX_CODEX_JS) {
+    codexExec = { cmd: process.execPath, prefix: [process.env.CCX_CODEX_JS], shell: false };
+    return codexExec;
+  }
   if (process.platform === 'win32') {
     for (const dir of String(process.env.PATH || '').split(';')) {
       const exe = dir ? path.join(dir, 'codex.exe') : '';
@@ -1026,6 +1032,7 @@ function runCodexTurn(msg, convId) {
       // 失败时：若本次是 resume，可能是会话已失效，清空后用同一消息重开新线程
       if (isResume && code !== 0) {
         console.error('[codex] resume 失败，回退新线程：' + tail);
+        clearTimeout(timer); // 本回合不走 finish() 结束，必须显式撤销超时定时器
         conv.sessionId = null;
         saveConversations();
         resolve();

@@ -110,10 +110,26 @@ codex-chat/
 ├─ index.html      # 前端全部逻辑（单文件）
 ├─ config.json     # 服务配置
 ├─ data/           # 运行时数据（不入库）：conversations.json / users.json / sessions.json
+├─ test/           # 离线端到端测试（e2e.js + codex-stub.js，不消耗 API 额度）
 ├─ start.bat       # Windows 启动脚本
 ├─ stop.bat        # Windows 停止脚本
-└─ package.json    # 依赖：express、socket.io
+└─ package.json    # 依赖：express、socket.io；开发依赖：socket.io-client
 ```
+
+## 开发与测试
+
+内置离线端到端测试，不消耗任何 Codex/API 额度、不依赖真实 Codex CLI：
+
+```bash
+npm install   # 含开发依赖 socket.io-client
+npm test
+```
+
+测试会在 `_test_temp/` 下用独立端口与独立数据目录拉起临时服务实例（不影响
+3100 生产服务），并通过 `CCX_CODEX_JS` 钩子用 `test/codex-stub.js` 桩脚本替代
+codex CLI（按 JSONL 协议伪造 `exec`/`resume`/`delete`/`--version`），覆盖账号与
+Socket 鉴权、多对话管理、JSONL 事件解析、命令过程广播、resume 与失败回退、
+消息截断、配置档/模型切换、持久化安全、删除清理等 76 项断言。
 
 ## License
 

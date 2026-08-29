@@ -4,3 +4,4 @@ logs/
 server.pid
 HANDOVER.md
 *.log
+_test_temp/
