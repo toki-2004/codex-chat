@@ -89,6 +89,33 @@ Windows 下也可直接双击 `start.bat`（可见控制台，关闭窗口即停
 3. 服务端解析 JSONL 事件：`thread.started` 里的 `thread_id` 持久化到对应对话（`data/conversations.json`）；`command_execution` 命令/输出实时广播 `chat-process` 供前端展示执行过程；回复经 Socket.io 广播（带流式标记与过程回放，前端打字机显示）；
 4. 消息严格串行处理（先进先出）；若续接失败（会话失效）自动为该对话重开新线程。
 
+## 架构
+
+```mermaid
+flowchart LR
+    subgraph clients["任意设备浏览器"]
+        UI["单文件 SPA<br>index.html"]
+    end
+    subgraph server["Node.js 服务（server.js）"]
+        REST["REST API<br>登录 / 账号 / 对话 / 配置档"]
+        WS["Socket.io<br>消息与执行过程广播"]
+        Q["全局串行队列<br>同一时间仅一个 Codex 回合"]
+    end
+    subgraph local["本机"]
+        CX["Codex CLI<br>exec / exec resume"]
+        DATA["data/*.json<br>对话 / 账号 / 会话"]
+        HOME["~/.codex<br>skills / 配置档 / 模型目录"]
+    end
+    UI -- "HTTP（登录后可用）" --> REST
+    UI -- "WebSocket（Cookie 鉴权）" --> WS
+    WS --> Q
+    Q -- "spawn --json" --> CX
+    CX -- "JSONL 事件流" --> Q
+    REST --> DATA
+    Q --> DATA
+    CX --> HOME
+```
+
 ## 安全说明
 
 - **默认配置下 Codex 可访问并修改本机任意文件、执行任意命令**（等同你本人在终端使用 Codex CLI），任何能访问该端口的人都能让 Codex 在本机做事。**请仅在可信网络（家庭/办公局域网）使用**，公网暴露前务必加反代 + HTTPS + 访问控制。
