@@ -2,7 +2,7 @@
   "port": 3100,
   "host": "0.0.0.0",
   "cwd": "D:\\pythonitems",
-  "model": null,
+  "model": "deepseek-v4-flash",
   "sandbox": "danger-full-access",
   "bypassApprovals": true,
   "skipGitRepoCheck": true,
@@ -13,5 +13,5 @@
   "modelProvider": null,
   "providers": [],
   "models": [],
-  "profile": "zcode"
+  "profile": null
 }
