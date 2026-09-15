@@ -152,6 +152,83 @@ function profileCatalogModels(profile) {
 }
 
 /* ---------------------------------------------------------------------------
+ * 实时模型列表：直接问当前配置档对应供应商的 /models（OpenAI 兼容）
+ *   - 供应商与密钥取自该配置档的 model_provider / [model_providers.<name>]
+ *     （base_url + experimental_bearer_token 或 env_key 指定的环境变量）
+ *   - 失败不抛错：返回 error，由调用方回落到本地静态清单
+ *   - 密钥只用于这一次请求，绝不回传前端或写日志
+ * ------------------------------------------------------------------------- */
+function tomlTextForProfile(profile) {
+  const file = profile
+    ? path.join(CODEX_HOME, profile + '.config.toml')
+    : path.join(CODEX_HOME, 'config.toml');
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    return '';
+  }
+}
+
+function providerForProfile(profile) {
+  const toml = tomlTextForProfile(profile);
+  const name = (/^\s*model_provider\s*=\s*"([^"]+)"/m.exec(toml) || [])[1] || '';
+  let block = '';
+  if (name) {
+    const safe = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp('\\[model_providers\\.' + safe + '\\]([\\s\\S]*?)(?=\\n\\s*\\[|$)');
+    block = (re.exec(toml) || [])[1] || '';
+  }
+  const baseUrl = (/^\s*base_url\s*=\s*"([^"]+)"/m.exec(block) || [])[1] || '';
+  const token = (/^\s*experimental_bearer_token\s*=\s*"([^"]+)"/m.exec(block) || [])[1] || '';
+  const envKey = (/^\s*env_key\s*=\s*"([^"]+)"/m.exec(block) || [])[1] || '';
+  const key = (envKey && process.env[envKey]) || token || process.env.OPENAI_API_KEY || '';
+  return { profile: profile || null, provider: name, baseUrl, key };
+}
+
+async function fetchProviderModels(profile) {
+  const info = providerForProfile(profile);
+  if (!info.baseUrl) {
+    return { models: [], provider: info.provider, error: '配置档里没有 base_url' };
+  }
+  const base = info.baseUrl.replace(/\/+$/, '');
+  const urls = [base + '/models'];
+  if (!/\/v\d+$/.test(base)) urls.push(base + '/v1/models');
+  let lastError = '';
+  for (const url of urls) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const r = await fetch(url, {
+        headers: info.key ? { authorization: 'Bearer ' + info.key } : {},
+        signal: ctrl.signal,
+      });
+      if (!r.ok) {
+        lastError = 'HTTP ' + r.status;
+        continue;
+      }
+      const data = await r.json();
+      const raw = Array.isArray(data) ? data : (data.data || data.models || []);
+      const ids = [];
+      for (const item of (Array.isArray(raw) ? raw : [])) {
+        if (item && item.supported_in_api === false) continue;   // 供应商目录里标了不供 API 的跳过
+        const id = typeof item === 'string' ? item : (item && (item.id || item.name || item.slug));
+        if (id && !ids.includes(String(id))) ids.push(String(id));
+      }
+      if (!ids.length) {
+        lastError = '返回里没有模型';
+        continue;
+      }
+      return { models: ids, url, provider: info.provider };
+    } catch (e) {
+      lastError = (e && e.name === 'AbortError') ? '请求超时' : ((e && e.message) || String(e));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return { models: [], provider: info.provider, error: lastError || '请求失败' };
+}
+
+/* ---------------------------------------------------------------------------
  * 工具函数：JSON 读写（tmp + rename 原子落盘）、写队列
  * ------------------------------------------------------------------------- */
 function readJSON(file, fallback) {
@@ -479,16 +556,34 @@ function resolveProfile(value) {
   return { value: v };
 }
 
-app.get('/api/model-options', requireAuth, (req, res) => {
+app.get('/api/model-options', requireAuth, async (req, res) => {
   const profiles = Array.isArray(config.profiles) ? config.profiles.slice() : [];
   for (const name of listCodexProfiles()) {
     if (!profiles.includes(name)) profiles.push(name);
   }
   if (config.profile && !profiles.includes(config.profile)) profiles.push(config.profile);
 
+  // ?profile=xxx 可指定要看的配置档（默认=当前生效的那个）；?refresh=1 实时问供应商
+  const wantProfile = req.query.profile ? resolveProfile(req.query.profile) : { value: config.profile };
+  const viewProfile = wantProfile.error ? config.profile : wantProfile.value;
+
   // 当前配置档的模型目录（默认配置读基础 config.toml 的 model_catalog_json）+ config.models 补充
-  const catalogModels = profileCatalogModels(config.profile);
-  const models = catalogModels.slice();
+  const catalogModels = profileCatalogModels(viewProfile);
+  let models = catalogModels.slice();
+  let modelsSource = 'catalog';
+  let modelsError = '';
+  let provider = '';
+  if (String(req.query.refresh) === '1') {
+    const live = await fetchProviderModels(viewProfile);
+    provider = live.provider || '';
+    if (live.models.length) {
+      // 实时结果排前面，本地清单里多出来的（比如目录里的隐藏档）补在后面
+      models = live.models.concat(models.filter((m) => !live.models.includes(m)));
+      modelsSource = 'api';
+    } else {
+      modelsError = live.error || '实时获取失败';
+    }
+  }
   for (const m of (Array.isArray(config.models) ? config.models : [])) {
     if (!models.includes(m)) models.push(m);
   }
@@ -496,8 +591,12 @@ app.get('/api/model-options', requireAuth, (req, res) => {
   res.json({
     profile: config.profile || 'default',
     model: config.model || 'default',
+    viewedProfile: viewProfile || 'default',
     profiles,
     models,
+    modelsSource,
+    modelsError,
+    provider,
   });
 });
 

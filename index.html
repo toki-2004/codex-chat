@@ -325,9 +325,14 @@ body {
   <div class="model-switch">
     <label for="profileSel">配置档（API 预设）</label>
     <select id="profileSel"></select>
-    <label for="modelSel">模型</label>
+    <label for="modelSel" style="display:flex;align-items:center;gap:6px">
+      <span>模型</span>
+      <button class="icon-btn" id="modelRefreshBtn" type="button" title="向供应商实时拉取模型列表"
+        style="margin-left:auto;font-size:11px;padding:2px 8px;border:1px solid var(--line);
+               border-radius:8px;background:var(--bg);color:var(--text);cursor:pointer">↻ 刷新</button>
+    </label>
     <select id="modelSel"></select>
-    <div class="ms-hint">API 由配置档决定（默认档沿用 ~/.codex/config.toml）；切换后下一轮回复生效</div>
+    <div class="ms-hint" id="modelHint">API 由配置档决定（默认档沿用 ~/.codex/config.toml）；切换后下一轮回复生效</div>
   </div>
   <div class="sp-body">
     <button class="menu-item" id="menuUsersBtn">👥 用户管理</button>
@@ -942,19 +947,29 @@ function fillSelect(sel, list, current) {
   if (sel.value !== (current || 'default')) sel.value = 'default';
 }
 
-async function loadModelOptions() {
+/* refresh=true 时问服务端要"实时模型列表"（服务端去供应商 /models 拉），
+   拉不到会回落到本地目录清单并给出原因，不会让下拉框变空 */
+async function loadModelOptions(refresh) {
   try {
-    const d = await fetchJSON('/api/model-options', {}, 8000);
+    const q = refresh ? '?refresh=1&profile=' + encodeURIComponent($('profileSel').value || '') : '';
+    const d = await fetchJSON('/api/model-options' + q, {}, refresh ? 20000 : 8000);
     serverCfg.profile = d.profile;
     serverCfg.model = d.model;
     fillSelect($('profileSel'), d.profiles, d.profile);
     fillSelect($('modelSel'), d.models, d.model);
+    if (refresh) {
+      $('modelHint').textContent = (d.modelsSource === 'api')
+        ? '已从 ' + (d.provider || '供应商') + ' 实时获取 ' + d.models.length + ' 个模型'
+        : '实时获取失败（' + (d.modelsError || '未知原因') + '），用的本地清单';
+    }
     updateFootbar();
-  } catch (e) { /* 面板静默失败，不影响聊天 */ }
+  } catch (e) {
+    if (refresh) $('modelHint').textContent = '实时获取失败：' + (e.message || e);
+  }   /* 面板静默失败，不影响聊天 */
 }
 
 /* 配置档或模型变化后立即保存；切配置档时模型重置为该档默认 */
-async function saveModelSettings() {
+async function saveModelSettings(refreshAfter) {
   try {
     const d = await fetchJSON('/api/model-settings', {
       method: 'POST',
@@ -968,7 +983,7 @@ async function saveModelSettings() {
     serverCfg.model = d.model;
     updateFootbar();
     toast('已切换：配置档 ' + d.profile + ' · 模型 ' + d.model + '（下一轮回复生效）');
-    await loadModelOptions();
+    await loadModelOptions(!!refreshAfter);   // 换配置档时顺手实时拉一次该档的模型
   } catch (e) {
     toast('切换失败：' + (e.message || e));
     loadModelOptions();
@@ -1155,8 +1170,9 @@ async function boot() {
   $('menuPwBtn').onclick = () => { togglePanel(null, false); changeOwnPassword(); };
   $('menuLogoutBtn').onclick = logout;
   $('nuAddBtn').onclick = addUser;
-  $('modelSel').onchange = saveModelSettings;
-  $('profileSel').onchange = () => { $('modelSel').value = 'default'; saveModelSettings(); };
+  $('modelSel').onchange = () => saveModelSettings(false);
+  $('profileSel').onchange = () => { $('modelSel').value = 'default'; saveModelSettings(true); };
+  $('modelRefreshBtn').onclick = () => loadModelOptions(true);
 
   $('modalMask').addEventListener('click', (e) => {
     if (e.target === $('modalMask')) closeModal(null);

@@ -15,6 +15,7 @@
  * --------------------------------------------------------------------------- */
 
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const { spawn } = require('child_process');
 const io = require('socket.io-client');
@@ -22,6 +23,10 @@ const io = require('socket.io-client');
 const ROOT = path.resolve(__dirname, '..');
 const PORT = 3170 + (process.pid % 80);
 const BASE = 'http://127.0.0.1:' + PORT;
+const MODEL_PORT = PORT + 600;          // 假供应商：给"实时刷新模型"用
+const DEAD_MODEL_PORT = MODEL_PORT + 1; // 故意没人监听：验证失败回落
+let modelStub = null;
+let modelStubAuth = '';
 
 /* ---------------- tiny assert/runner ---------------- */
 let passed = 0;
@@ -75,7 +80,28 @@ function prepare() {
   const catalogFake = path.join(tmp, 'catalog-fake.json');
   fs.writeFileSync(catalogFake, JSON.stringify({ models: [{ slug: 'fake-model' }] }));
   fs.writeFileSync(path.join(codexHome, 'fakeprofile.config.toml'),
-    'model = "fake-model"\nmodel_catalog_json = "' + catalogFake.replace(/\\/g, '/') + '"\n');
+    'model = "fake-model"\n'
+    + 'model_provider = "stubprov"\n'
+    + 'model_catalog_json = "' + catalogFake.replace(/\\/g, '/') + '"\n'
+    + '[model_providers.stubprov]\n'
+    + 'base_url = "http://127.0.0.1:' + MODEL_PORT + '"\n'
+    + 'experimental_bearer_token = "stub-secret-key"\n');
+  // 指向没人监听的端口：实时刷新必须失败回落，而不是把模型列表清空
+  const catalogDead = path.join(tmp, 'catalog-dead.json');
+  fs.writeFileSync(catalogDead, JSON.stringify({ models: [{ slug: 'dead-model' }] }));
+  fs.writeFileSync(path.join(codexHome, 'deadprofile.config.toml'),
+    'model = "dead-model"\n'
+    + 'model_provider = "deadprov"\n'
+    + 'model_catalog_json = "' + catalogDead.replace(/\\/g, '/') + '"\n'
+    + '[model_providers.deadprov]\n'
+    + 'base_url = "http://127.0.0.1:' + DEAD_MODEL_PORT + '"\n');
+  // 大模型平台（如智谱）的 /models 返回的是 Codex 目录形态：{models:[{slug,supported_in_api}]}
+  fs.writeFileSync(path.join(codexHome, 'slugprofile.config.toml'),
+    'model = "slug-model-x"\n'
+    + 'model_provider = "slugprov"\n'
+    + 'model_catalog_json = "' + catalogFake.replace(/\\/g, '/') + '"\n'
+    + '[model_providers.slugprov]\n'
+    + 'base_url = "http://127.0.0.1:' + MODEL_PORT + '/slugstyle"\n');
 
   fs.writeFileSync(path.join(tmp, 'config.json'), JSON.stringify({
     port: PORT,
@@ -86,6 +112,31 @@ function prepare() {
     turnTimeoutMs: 20000,
     systemPrompt: 'SYS-MARKER cwd={cwd} home={codexHome}',
   }, null, 2));
+}
+
+/* 假供应商：/models 返回 OpenAI 兼容的模型列表，并记下收到的 Authorization */
+function startModelStub() {
+  return new Promise((resolve) => {
+    modelStub = http.createServer((req, res) => {
+      modelStubAuth = req.headers.authorization || '';
+      if (req.url === '/slugstyle/models' || req.url === '/slugstyle/v1/models') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ models: [
+          { slug: 'slug-model-x' },
+          { slug: 'slug-model-y', supported_in_api: false },
+        ] }));
+        return;
+      }
+      if (req.url === '/models' || req.url === '/v1/models') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ id: 'live-model-a' }, { id: 'live-model-b' }] }));
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    modelStub.listen(MODEL_PORT, '127.0.0.1', resolve);
+  });
 }
 
 function startServer() {
@@ -173,6 +224,7 @@ function stopServer(proc) {
   let adminSock = null;
   try {
     prepare();
+    await startModelStub();
     server = startServer();
     const health = await waitHealthy();
 
@@ -320,8 +372,14 @@ function stopServer(proc) {
     const recovered = await waitFor(admin.events['chat-message'], (m) => m.role === 'agent' && m.text === 'RECOVERED', 'recovered reply', 15000);
     check('requeued turn answered after resume failure', !!recovered);
     await waitFor(admin.events['codex-status'], (s) => s.busy === false, 'idle after fallback', 10000).catch(() => {});
-    const convsFile3 = JSON.parse(fs.readFileSync(path.join(dataDir, 'conversations.json'), 'utf8'));
-    const conv1c = convsFile3.conversations.find((c) => c.id === conv1.id);
+    // conversations.json 是异步落盘的：等新线程 id 真的写进去再断言（原来读一次就断言，偶发假失败）
+    let conv1c = null;
+    for (let i = 0; i < 20; i++) {
+      const convsFile3 = JSON.parse(fs.readFileSync(path.join(dataDir, 'conversations.json'), 'utf8'));
+      conv1c = convsFile3.conversations.find((c) => c.id === conv1.id);
+      if (conv1c && conv1c.sessionId && conv1c.sessionId !== thread1) break;
+      await sleep(150);
+    }
     check('session id rotated after resume failure', conv1c.sessionId && conv1c.sessionId !== thread1, conv1c.sessionId);
 
     /* ---- S11 message length clamp + empty message ---- */
@@ -354,6 +412,33 @@ function stopServer(proc) {
     const tmpConfig = JSON.parse(fs.readFileSync(path.join(tmp, 'config.json'), 'utf8'));
     check('selection persisted to temp config.json', tmpConfig.profile === 'fakeprofile' && tmpConfig.model === 'fake-model', tmpConfig);
 
+    /* ---- S12b 实时刷新模型（问供应商的 /models） ---- */
+    console.log('S12b live model refresh');
+    r = await api('GET', '/api/model-options?profile=fakeprofile', undefined, adminCookie);
+    check('no refresh -> local catalog only',
+      r.json.modelsSource === 'catalog' && r.json.models.includes('fake-model')
+      && !r.json.models.includes('live-model-a'), r.json);
+    r = await api('GET', '/api/model-options?refresh=1&profile=fakeprofile', undefined, adminCookie);
+    check('refresh -> models fetched live from the provider',
+      r.status === 200 && r.json.modelsSource === 'api' && r.json.provider === 'stubprov'
+      && r.json.models.includes('live-model-a') && r.json.models.includes('live-model-b'), r.json);
+    check('live list keeps local extras after the live ones',
+      r.json.models.indexOf('live-model-a') < r.json.models.indexOf('fake-model'), r.json.models);
+    check('provider got the bearer token from the profile',
+      modelStubAuth === 'Bearer stub-secret-key', modelStubAuth);
+    check('token never reaches the client', JSON.stringify(r.json).indexOf('stub-secret-key') < 0);
+    r = await api('GET', '/api/model-options?refresh=1&profile=deadprofile', undefined, adminCookie);
+    check('refresh failure falls back to the catalog with a reason',
+      r.json.modelsSource === 'catalog' && r.json.models.includes('dead-model')
+      && typeof r.json.modelsError === 'string' && r.json.modelsError.length > 0, r.json);
+    r = await api('GET', '/api/model-options?refresh=1&profile=no-such-profile', undefined, adminCookie);
+    check('unknown profile on refresh falls back to the active one',
+      r.status === 200 && Array.isArray(r.json.models) && r.json.models.length > 0, r.json);
+    r = await api('GET', '/api/model-options?refresh=1&profile=slugprofile', undefined, adminCookie);
+    check('catalog-shaped /models (models[].slug) parsed, unsupported filtered out',
+      r.json.modelsSource === 'api' && r.json.models.includes('slug-model-x')
+      && !r.json.models.includes('slug-model-y'), r.json);
+
     /* ---- S13 security: no plaintext passwords on disk ---- */
     console.log('S13 persistence security');
     const usersRaw = fs.readFileSync(path.join(dataDir, 'users.json'), 'utf8');
@@ -379,6 +464,7 @@ function stopServer(proc) {
   } finally {
     if (adminSock) { try { adminSock.close(); } catch (e) {} }
     await stopServer(server);
+    if (modelStub) { try { modelStub.close(); } catch (e) {} }
     try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 3 }); } catch (e) {
       console.log('  WARN temp dir not removed: ' + tmp);
     }
