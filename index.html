@@ -564,14 +564,18 @@ function renderConvList() {
     return '<div class="conv-item ' + (active ? 'active' : '') + '" data-id="' + esc(c.id) + '">'
       + '<div class="c-info"><div class="c-title">' + esc(c.title || '新对话') + '</div>'
       + '<div class="c-sub">' + c.messageCount + ' 条消息 · ' + fmtTime(c.updatedAt || c.createdAt) + '</div></div>'
+      + '<button class="c-ren" data-ren="' + esc(c.id) + '" title="重命名对话">✎</button>'
       + '<button class="c-del" data-del="' + esc(c.id) + '" title="删除对话">✕</button>'
       + '</div>';
   }).join('');
   el.querySelectorAll('.conv-item').forEach((row) => {
     row.onclick = (e) => {
-      if (e.target.closest('.c-del')) return;
+      if (e.target.closest('.c-del, .c-ren')) return;
       switchConversation(row.dataset.id);
     };
+  });
+  el.querySelectorAll('.c-ren').forEach((btn) => {
+    btn.onclick = (e) => { e.stopPropagation(); renameConversation(btn.dataset.ren); };
   });
   el.querySelectorAll('.c-del').forEach((btn) => {
     btn.onclick = (e) => { e.stopPropagation(); deleteConversation(btn.dataset.del); };
@@ -624,6 +628,44 @@ async function switchConversation(id) {
   } catch (e) {
     toast('切换对话失败：' + e.message);
   }
+}
+
+/* 手动重命名：PATCH 后由服务端广播，多端同步；手动改过的标题 AI 不再覆盖 */
+function renameConversation(id) {
+  const conv = conversations.find((c) => c.id === id);
+  openModal(
+    '<h3>重命名对话</h3>'
+    + '<input id="rnInput" maxlength="40" placeholder="对话标题（40 字以内）" autocomplete="off">'
+    + '<div class="modal-btns"><button class="btn" id="rnCancel">取消</button>'
+    + '<button class="btn primary" id="rnOk">保存</button></div>',
+    (box) => {
+      const input = box.querySelector('#rnInput');
+      input.value = (conv && conv.title) || '';
+      input.focus();
+      input.select();
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.isComposing) closeModal({ title: input.value });
+      });
+      box.querySelector('#rnCancel').onclick = () => closeModal(null);
+      box.querySelector('#rnOk').onclick = () => closeModal({ title: input.value });
+    }
+  ).then(async (res) => {
+    if (!res) return;
+    const title = String(res.title || '').trim();
+    if (!title || (conv && title === conv.title)) return;
+    try {
+      const data = await fetchJSON('/api/conversations/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      }, 8000);
+      if (!data.ok) throw new Error('重命名失败');
+      toast('标题已更新');
+      await loadConversations();
+    } catch (e) {
+      toast('重命名失败：' + e.message);
+    }
+  });
 }
 
 function deleteConversation(id) {

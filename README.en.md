@@ -9,7 +9,7 @@ Self-hosted remote chat for Codex: it turns the Codex CLI installed on your mach
 Each conversation maps to an independent Codex session (thread). Only one conversation is active at a time, and all devices share the currently active conversation — just like talking to Codex directly:
 
 - Messages sent from any device go into the Codex session of the currently active conversation, and replies are broadcast in real time to all online devices;
-- **Conversations can be created / switched / deleted**: creating a conversation opens a brand-new Codex thread; deleting one cleans up both the local record and the corresponding Codex thread;
+- **Conversations can be created / switched / renamed / deleted**: creating a conversation opens a brand-new Codex thread; deleting one cleans up both the local record and the corresponding Codex thread; titles are summarized by the AI (and can be renamed by hand);
 - Codex runs with your machine's default configuration (`~/.codex/config.toml`) and automatically reads the skills under `~/.codex/skills/`, preserving your existing habits and preferences;
 - The working root is a real project directory on your machine (default `D:\pythonitems`); Codex can read and write all projects, files, and the environment on that machine, regardless of which client you use;
 - Sessions are persisted and survive service restarts (`codex exec resume` continues the conversation).
@@ -128,7 +128,7 @@ npm install   # 含开发依赖 socket.io-client
 npm test
 ```
 
-The tests spin up a temporary service instance under `_test_temp/` with its own port and data directory (leaving the production service on port 3100 untouched), and replace the codex CLI via the `CCX_CODEX_JS` hook with the `test/codex-stub.js` stub script (faking `exec`/`resume`/`delete`/`--version` according to the JSONL protocol), covering 76 assertions across account and Socket authentication, multi-conversation management, JSONL event parsing, command process broadcasting, resume and failure fallback, message truncation, profile/model switching, persistence safety, and deletion cleanup.
+The tests spin up a temporary service instance under `_test_temp/` with its own port and data directory (leaving the production service on port 3100 untouched), and replace the codex CLI via the `CCX_CODEX_JS` hook with the `test/codex-stub.js` stub script (faking `exec`/`resume`/`delete`/`--version` according to the JSONL protocol), covering 97 assertions across account and Socket authentication, multi-conversation management, JSONL event parsing, command process broadcasting, resume and failure fallback, message truncation, profile/model switching, conversation titles (AI summary + manual rename), persistence safety, and deletion cleanup.
 
 ## License
 

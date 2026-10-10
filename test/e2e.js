@@ -180,7 +180,7 @@ function connectSocket(cookie) {
       reconnection: false,
       timeout: 5000,
     });
-    const events = { 'chat-message': [], 'chat-process': [], 'codex-status': [], 'model-changed': [], welcome: [], members: [] };
+    const events = { 'chat-message': [], 'chat-process': [], 'codex-status': [], 'model-changed': [], conversations: [], welcome: [], members: [] };
     for (const key of Object.keys(events)) {
       sock.on(key, (payload) => events[key].push(payload));
     }

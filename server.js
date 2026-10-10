@@ -99,6 +99,8 @@ const MAX_CONVERSATIONS = 50; // 对话数量上限，超出时自动删除最�
 const MAX_PROCESS_ENTRIES = 30;   // 单回合过程记录条数上限
 const MAX_PROCESS_TEXT = 2000;    // 单条过程文本/命令长度上限
 const MAX_PROCESS_OUTPUT = 8000;  // 单条命令输出长度上限
+const MAX_TITLE_LEN = 40;         // 对话标题长度上限（AI 总结的另按 12 字提示）
+const TITLE_TIMEOUT = 90000;      // 让 Codex 总结标题的单次超时
 const AGENT_USER = { userId: 'codex', name: 'Codex', color: '#10a37f' };
 const SYSTEM_USER = { userId: 'system', name: '系统', color: '#8a8f98' };
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -427,6 +429,133 @@ function broadcastConversations() {
   io.emit('conversations', {
     activeId: data.activeId,
     conversations: data.conversations.map(convPublic),
+  });
+}
+
+/* ---------------------------------------------------------------------------
+ * 对话标题
+ *   新对话发出第一条后先用消息开头当占位标题（titleSource='auto'），
+ *   第一条回复结束后让 Codex 自己总结一个短标题（titleSource='ai'）；
+ *   用户手动改过的标题（titleSource='user'）AI 永远不再覆盖。
+ *   老数据没有 titleSource，视为已定稿，不自动改名。
+ * ------------------------------------------------------------------------- */
+const titleQueue = [];
+let titleJobRunning = false;
+
+function cleanTitle(raw, max) {
+  let t = String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim();
+  t = t.replace(/^[#>*\-\s]+/, '').replace(/^\s*(?:标题|title)\s*[:：]\s*/i, '');
+  t = t.replace(/^["'“”‘’「『《【]+/, '').replace(/["'“”‘’」』》】]+$/, '');
+  t = t.replace(/[。．.!！?？,，;；:：、]+$/, '').trim();
+  const limit = Number(max) > 0 ? Number(max) : MAX_TITLE_LEN;
+  if (t.length > limit) t = t.slice(0, limit).trim();
+  return t;
+}
+
+function requestConversationTitle(convId) {
+  const conv = getConversations().conversations.find((c) => c.id === convId);
+  if (!conv || conv.titleDone || conv.titleSource === 'user') return;
+  if (!titleQueue.includes(convId)) titleQueue.push(convId);
+  pumpTitleQueue();
+}
+
+async function pumpTitleQueue() {
+  if (titleJobRunning) return;
+  titleJobRunning = true;
+  try {
+    while (titleQueue.length) await generateConversationTitle(titleQueue.shift());
+  } catch (e) {
+    console.error('[title] 生成标题异常：' + e.message);
+  } finally {
+    titleJobRunning = false;
+  }
+}
+
+/* 单独起一个临时 Codex 线程问标题（不动当前会话），拿到后删掉临时线程 */
+function generateConversationTitle(convId) {
+  return new Promise((resolve) => {
+    const conv = getConversations().conversations.find((c) => c.id === convId);
+    if (!conv || conv.titleSource === 'user' || conv.titleDone) return resolve();
+    const picked = conv.messages.filter((m) => m.role === 'user' || m.role === 'agent').slice(0, 4);
+    if (!picked.length) return resolve();
+    conv.titleDone = true; // 只试一次；失败就继续用首条消息的占位标题
+    saveConversations();
+
+    const excerpt = picked.map((m) => (m.role === 'user' ? '用户：' : '助手：')
+      + String(m.text || '').replace(/\s+/g, ' ').slice(0, 300)).join('\n');
+    const prompt = '给下面这段对话起一个不超过 12 个字的简体中文标题，'
+      + '只输出标题本身，不要引号、标点或解释。\n\n' + excerpt;
+    const startedAt = Date.now();
+    let finished = false;
+
+    const spawnTitle = () => {
+      let exec;
+      try {
+        exec = resolveCodexExec();
+      } catch (e) {
+        return resolve();
+      }
+      const { args } = buildCodexArgs(prompt, { sessionId: null });
+      console.log('[title] 让 Codex 总结标题 <- ' + convId);
+      const proc = spawn(exec.cmd, exec.prefix.concat(args), {
+        cwd: ROOT,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: exec.shell,
+      });
+
+      let buf = '';
+      let text = '';
+      let threadId = null;
+
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        if (threadId) deleteCodexThread(threadId); // 标题用的临时线程用完即删
+        const title = cleanTitle(text);
+        const cur = getConversations().conversations.find((c) => c.id === convId);
+        if (title && cur && cur.titleSource !== 'user') {
+          cur.title = title;
+          cur.titleSource = 'ai';
+          saveConversations();
+          broadcastConversations();
+          console.log('[title] ' + convId + ' -> ' + title);
+        } else {
+          console.error('[title] 标题生成失败或无内容，保留原标题');
+        }
+        resolve();
+      };
+
+      const timer = setTimeout(() => {
+        killProcTree(proc);
+        done();
+      }, TITLE_TIMEOUT);
+
+      proc.stdout.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line) continue;
+          handleCodexEvent(line, {
+            setSession: (id) => { threadId = id; },
+            addDelta: (t) => { text += t; },
+            setText: (t) => { text = t; },
+          });
+        }
+      });
+      proc.on('error', done);
+      proc.on('close', done);
+    };
+
+    // 单线会话：等聊天回合跑完再起标题（最多等 60 秒，之后照样跑）
+    const waitIdle = () => {
+      if (state.busy && Date.now() - startedAt < 60000) return setTimeout(waitIdle, 1000);
+      spawnTitle();
+    };
+    waitIdle();
   });
 }
 
@@ -767,6 +896,19 @@ app.get('/api/conversations/:id', requireAuth, (req, res) => {
   res.json({ ok: true, conversation: conv });
 });
 
+app.patch('/api/conversations/:id', requireAuth, (req, res) => {
+  const data = getConversations();
+  const conv = data.conversations.find((c) => c.id === String(req.params.id || ''));
+  if (!conv) return res.status(404).json({ error: '对话不存在' });
+  const title = cleanTitle((req.body || {}).title, MAX_TITLE_LEN);
+  if (!title) return res.status(400).json({ error: '标题不能为空' });
+  conv.title = title;
+  conv.titleSource = 'user'; // 手动改过的标题，AI 总结不再覆盖
+  saveConversations();
+  broadcastConversations();
+  res.json({ ok: true, conversation: convPublic(conv) });
+});
+
 app.delete('/api/conversations/:id', requireAuth, (req, res) => {
   const id = String(req.params.id || '');
   const data = getConversations();
@@ -865,6 +1007,7 @@ io.on('connection', (socket) => {
     // 第一条消息自动作为对话标题
     if (conv.messages.length === 0 && (conv.title === '新对话' || !conv.title)) {
       conv.title = text.length > 14 ? text.slice(0, 14) + '…' : text;
+      conv.titleSource = 'auto';
       saveConversations();
       broadcastConversations();
     }
