@@ -520,12 +520,10 @@ function msgBubble(m) {
   const cls = isAgent ? 'agent' : (isMe ? 'me' : 'other');
   const name = isAgent ? 'Codex' : m.name;
   const color = isAgent ? '#10a37f' : (m.color || '#888888');
-  // 实时收到的消息：过程已在 processArea 持久显示，气泡只放结论；
-  // 历史加载或漏收过程事件的消息：气泡内嵌展开的过程回放
-  const hideLiveProc = m.live && processBlocks.length > 0;
   // 复制按钮放气泡尾部（右下角）：比挤在 meta 行里好点，码块右上角另有一个
   const foot = '<div class="msg-foot"><button class="copy-btn" data-copy="msg">复制</button></div>';
-  const body = isAgent ? '<div class="bubble">' + (hideLiveProc ? '' : renderProcessHistory(m.process)) + renderMarkdown(m.text) + foot + '</div>'
+  // 过程回放一律渲染在气泡里：实时到达的回复也要和刷新后长得一模一样（否则"刷新才出现"）
+  const body = isAgent ? '<div class="bubble">' + renderProcessHistory(m.process) + renderMarkdown(m.text) + foot + '</div>'
     : '<div class="bubble">' + esc(m.text) + foot + '</div>';
   return '<div class="msg-row ' + cls + '" data-mid="' + esc(m.id) + '">'
     + '<div class="msg-meta"><span class="m-name" style="color:' + esc(color) + '">' + esc(name) + '</span>'
@@ -1027,7 +1025,9 @@ socket.on('model-changed', (p) => {
 socket.on('chat-message', (m) => {
   if (!m || m.text == null) return;
   if (m.conversationId && m.conversationId !== displayedConvId) return;
-  m.live = true; // 本回合实时到达：过程已在过程区展示，气泡内不再重复回放
+  // 最终回复（agent）落到气泡里时，实时过程区收起：过程已经跟着回复回到气泡内（与刷新后的样子一致），
+  // 否则同一批命令会在气泡和过程区各显示一遍
+  if (m.role === 'agent' || m.userId === 'codex') clearProcess();
   mergeMessages([m]);
   renderChat();
   hintNew();
