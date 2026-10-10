@@ -163,7 +163,7 @@ npm test
 codex CLI（按 JSONL 协议伪造 `exec`/`resume`/`delete`/`--version`），覆盖账号与
 Socket 鉴权、多对话管理、JSONL 事件解析、命令过程广播、resume 与失败回退、
 消息截断、配置档/模型切换、对话标题（AI 总结 + 手动重命名）、持久化安全、
-删除清理等 97 项断言。
+停止当前回合、会话自动续期、删除清理等 107 项断言。
 
 ## License
 

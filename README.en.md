@@ -131,7 +131,7 @@ npm install   # 含开发依赖 socket.io-client
 npm test
 ```
 
-The tests spin up a temporary service instance under `_test_temp/` with its own port and data directory (leaving the production service on port 3100 untouched), and replace the codex CLI via the `CCX_CODEX_JS` hook with the `test/codex-stub.js` stub script (faking `exec`/`resume`/`delete`/`--version` according to the JSONL protocol), covering 97 assertions across account and Socket authentication, multi-conversation management, JSONL event parsing, command process broadcasting, resume and failure fallback, message truncation, profile/model switching, conversation titles (AI summary + manual rename), persistence safety, and deletion cleanup.
+The tests spin up a temporary service instance under `_test_temp/` with its own port and data directory (leaving the production service on port 3100 untouched), and replace the codex CLI via the `CCX_CODEX_JS` hook with the `test/codex-stub.js` stub script (faking `exec`/`resume`/`delete`/`--version` according to the JSONL protocol), covering 107 assertions across account and Socket authentication, multi-conversation management, JSONL event parsing, command process broadcasting, resume and failure fallback, message truncation, profile/model switching, conversation titles (AI summary + manual rename), persistence safety, stopping a running turn, session auto-renewal, and deletion cleanup.
 
 ## License
 
