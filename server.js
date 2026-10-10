@@ -343,6 +343,11 @@ function sessionFromRequest(req) {
   if (!m) return null;
   const s = sessions[m[1]];
   if (!s || s.expires < Date.now()) return null;
+  // 会话自动续期：用掉一半有效期就顺延，常用设备不会用着用着被踢回登录页
+  if (s.expires - Date.now() < SESSION_TTL / 2) {
+    s.expires = Date.now() + SESSION_TTL;
+    saveSessions();
+  }
   return s;
 }
 
@@ -616,19 +621,17 @@ function deleteConversation(id) {
   return true;
 }
 
-function pushMessageTo(conv, msg, opts) {
+function pushMessageTo(conv, msg) {
   if (!conv) return;
   conv.messages.push(msg);
   if (conv.messages.length > MAX_HISTORY) conv.messages = conv.messages.slice(-MAX_HISTORY);
   conv.updatedAt = Date.now();
   saveConversations();
-  const payload = Object.assign({}, msg, { conversationId: conv.id });
-  if (opts && opts.stream) payload.stream = true;
-  io.emit('chat-message', payload);
+  io.emit('chat-message', Object.assign({}, msg, { conversationId: conv.id }));
 }
 
 function pushMessage(msg) {
-  pushMessageTo(getActiveConversation(), msg, null);
+  pushMessageTo(getActiveConversation(), msg);
 }
 
 /* ---------------------------------------------------------------------------
@@ -929,10 +932,9 @@ const io = new Server(server, { maxHttpBufferSize: 64 * 1024 });
 
 // Socket 鉴权：必须携带有效登录 Cookie，身份取自账号
 io.use((socket, next) => {
-  const cookie = String(socket.handshake.headers.cookie || '');
-  const m = /(?:^|;\s*)cc_session=([^;]+)/.exec(cookie);
-  const s = m && sessions[m[1]];
-  if (!s || s.expires < Date.now()) return next(new Error('unauthorized'));
+  // 复用 REST 的会话解析：Cookie 校验与自动续期只维护一份
+  const s = sessionFromRequest(socket.handshake);
+  if (!s) return next(new Error('unauthorized'));
   socket.data.account = s;
   next();
 });
@@ -982,6 +984,7 @@ io.on('connection', (socket) => {
     sandbox: config.sandbox,
     maxMessageLen: MAX_MESSAGE_LEN,
   }});
+  socket.emit('codex-status', { busy: state.busy }); // 刷新/新设备立刻拿到真实忙碌状态
 
   socket.on('set-user', (payload, ack) => {
     const doAck = typeof ack === 'function' ? ack : () => {};
@@ -994,6 +997,11 @@ io.on('connection', (socket) => {
     }
     broadcastMembers();
     doAck({ ok: true });
+  });
+
+  socket.on('stop-turn', (payload, ack) => {
+    const doAck = typeof ack === 'function' ? ack : () => {};
+    doAck(stopCurrentTurn());
   });
 
   socket.on('chat-message', (payload, ack) => {
@@ -1021,7 +1029,7 @@ io.on('connection', (socket) => {
       at: Date.now(),
       role: 'user',
     };
-    pushMessageTo(conv, msg, null);
+    pushMessageTo(conv, msg);
     doAck({ ok: true });
     enqueueCodexTurn(msg, conv.id);
   });
@@ -1035,7 +1043,7 @@ io.on('connection', (socket) => {
 /* ---------------------------------------------------------------------------
  * Codex 桥接：全局一条会话，消息串行排队处理
  * ------------------------------------------------------------------------- */
-const state = { busy: false, queue: [], proc: null };
+const state = { busy: false, queue: [], proc: null, stop: false };
 
 /* Windows 下 codex 通常是 npm 安装的 .cmd 包装，Node spawn 直接执行会 ENOENT；
  * 优先解析到 @openai/codex 的 JS 入口，用 node 直接启动 */
@@ -1080,6 +1088,16 @@ function broadcastCodexStatus(busy) {
   io.emit('codex-status', { busy });
 }
 
+/* 停止当前回合：丢弃排队消息并杀掉正在跑的 codex 进程（退出经 close 收尾） */
+function stopCurrentTurn() {
+  if (!state.busy) return { ok: false, reason: '当前没有正在运行的回合' };
+  const dropped = state.queue.length;
+  state.queue.length = 0;
+  state.stop = true;
+  killProcTree(state.proc);
+  return { ok: true, dropped };
+}
+
 function enqueueCodexTurn(msg, convId) {
   // 总是入队：busy 时由正在运行的 processCodexQueue 循环继续消费，
   // 修复旧逻辑 busy 时直接 return 导致消息被静默丢弃（不回复、模型收不到）。
@@ -1093,12 +1111,13 @@ function enqueueCodexTurn(msg, convId) {
     .finally(() => {
       state.busy = false;
       state.proc = null;
+      state.stop = false;
       broadcastCodexStatus(false);
     });
 }
 
 async function processCodexQueue() {
-  while (true) {
+  while (!state.stop) { // 已点停止：排队中的消息不再执行
     const next = state.queue.shift();
     if (!next) return;
     broadcastCodexStatus(true);
@@ -1199,7 +1218,9 @@ function runCodexTurn(msg, convId) {
           at: Date.now(),
           role: 'agent',
           process: proc.length ? proc : undefined,
-        }, { stream: true });
+        });
+        // 本条是该对话第一条回复：让 Codex 自己总结标题（用户手动改过的不会覆盖）
+        if (conv.titleSource === 'auto') requestConversationTitle(conv.id);
       } else if (errorInfo) {
         pushMessageTo(conv, {
           id: newId('m'),
@@ -1209,7 +1230,7 @@ function runCodexTurn(msg, convId) {
           text: errorInfo,
           at: Date.now(),
           role: 'system',
-        }, null);
+        });
       }
       resolve();
     };
@@ -1268,6 +1289,11 @@ function runCodexTurn(msg, convId) {
       if (turnDone) return;
       if (agentText) {
         finish(agentText, null);
+        return;
+      }
+      // 用户按了停止：进程是我们杀的，不当失败、也不重开线程重试
+      if (state.stop) {
+        finish(null, '已停止当前回合。');
         return;
       }
       const tail = stderrTail.trim().split('\n').slice(-3).join(' | ').slice(0, 300);

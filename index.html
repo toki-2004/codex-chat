@@ -164,6 +164,11 @@ body {
   background: var(--accent); color: #fff; font-size: 18px; cursor: pointer;
 }
 .send-btn:disabled { opacity: .45; }
+.stop-btn {
+  flex: none; height: 44px; padding: 0 14px; border-radius: 12px; cursor: pointer;
+  border: 1px solid var(--danger); background: var(--card); color: var(--danger); font-size: 13px;
+}
+.stop-btn:active { background: #fdecec; }
 .footbar {
   flex: none; padding: 6px 14px calc(6px + env(safe-area-inset-bottom));
   font-size: 11px; color: var(--muted); text-align: center; border-top: 1px solid var(--line);
@@ -234,11 +239,19 @@ body {
   cursor: pointer; padding: 4px 7px; border-radius: 8px; flex: none;
 }
 .conv-item .c-del:active { background: var(--bg); color: var(--danger); }
-.stream-caret {
-  display: inline-block; width: 2px; height: 1em; background: var(--agent);
-  vertical-align: -2px; margin-left: 2px; animation: caretBlink .8s infinite;
+.conv-item .c-ren {
+  border: none; background: none; color: var(--muted); font-size: 13px;
+  cursor: pointer; padding: 4px 7px; border-radius: 8px; flex: none;
 }
-@keyframes caretBlink { 0%, 45% { opacity: 1; } 50%, 100% { opacity: 0; } }
+.conv-item .c-ren:active { background: var(--bg); color: var(--accent); }
+/* 复制按钮：代码块右上角一个，消息 meta 行一个 */
+.code-wrap { position: relative; }
+.copy-btn {
+  border: 1px solid var(--line); background: rgba(255,255,255,.92); color: var(--muted);
+  border-radius: 8px; font-size: 11px; padding: 2px 8px; cursor: pointer; line-height: 1.6;
+}
+.copy-btn:active { color: var(--accent); border-color: var(--accent); }
+.code-wrap .copy-btn { position: absolute; top: 4px; right: 4px; }
 
 /* ---------- 弹窗 ---------- */
 .modal-mask {
@@ -309,6 +322,7 @@ body {
 
   <footer class="input-bar">
     <textarea id="chatInput" rows="1" placeholder="给本机 Codex 发消息，Enter 发送" autocomplete="off"></textarea>
+    <button class="stop-btn hidden" id="stopBtn" title="停止当前回复">停止</button>
     <button class="send-btn" id="sendBtn" title="发送">➤</button>
   </footer>
   <div class="footbar" id="footbar">加载中…</div>
@@ -418,8 +432,6 @@ let activeConvId = null; // 服务端当前活跃对话
 let displayedConvId = null; // 本端正在展示的对话
 let codexBusy = false;
 let serverCfg = { cwd: '', profile: 'default', model: 'default', sandbox: '', maxMessageLen: 500 };
-let streamTimer = null;  // 流式打字机定时器
-let streamMsgId = null;  // 正在流式显示的 agent 消息 id
 let processBlocks = [];  // 当前回合实时执行过程块
 let processCmdIdx = null; // 正在运行的命令块索引
 
@@ -429,7 +441,10 @@ const socket = io({ autoConnect: false, transports: ['websocket', 'polling'] });
 function renderMarkdown(text) {
   const blocks = [];
   let html = esc(text).replace(/```([\s\S]*?)```/g, (m, code) => {
-    blocks.push('<pre class="code"><code>' + code + '</code></pre>');
+    // 丢掉 ```js 这行的语言标记，否则它会当成代码正文显示出来
+    const body = code.replace(/^[a-zA-Z0-9+#.-]*\n/, '');
+    blocks.push('<div class="code-wrap"><button class="copy-btn" data-copy="code">复制</button>'
+      + '<pre class="code"><code>' + body + '</code></pre></div>');
     return '\u0000' + (blocks.length - 1) + '\u0000';
   });
   html = html
@@ -470,12 +485,13 @@ function msgBubble(m) {
   const color = isAgent ? '#10a37f' : (m.color || '#888888');
   // 实时收到的消息：过程已在 processArea 持久显示，气泡只放结论；
   // 历史加载或漏收过程事件的消息：气泡内嵌展开的过程回放
-  const hideLiveProc = m.stream && processBlocks.length > 0;
+  const hideLiveProc = m.live && processBlocks.length > 0;
   const body = isAgent ? '<div class="bubble">' + (hideLiveProc ? '' : renderProcessHistory(m.process)) + renderMarkdown(m.text) + '</div>'
     : '<div class="bubble">' + esc(m.text) + '</div>';
   return '<div class="msg-row ' + cls + '" data-mid="' + esc(m.id) + '">'
     + '<div class="msg-meta"><span class="m-name" style="color:' + esc(color) + '">' + esc(name) + '</span>'
-    + (isMe ? '<span>(我)</span>' : '') + '<span>' + fmtTime(m.at) + '</span></div>'
+    + (isMe ? '<span>(我)</span>' : '') + '<span>' + fmtTime(m.at) + '</span>'
+    + '<button class="copy-btn" data-copy="msg">复制</button></div>'
     + body + '</div>';
 }
 
@@ -697,52 +713,50 @@ function deleteConversation(id) {
   });
 }
 
-/* ================= 流式打字机 ================= */
-function stopStream() {
-  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
-  if (streamMsgId) {
-    const m = messages.find((x) => x.id === streamMsgId);
-    streamMsgId = null;
-    if (m) {
-      const row = $('msgList').querySelector('[data-mid="' + m.id + '"]');
-      if (row) {
-        const b = row.querySelector('.bubble');
-        if (b) b.innerHTML = renderMarkdown(m.text || '');
-      }
+/* ================= 复制 ================= */
+async function copyText(text) {
+  const s = String(text == null ? '' : text);
+  if (!s) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(s);
+      return true;
     }
+  } catch (e) { /* 落到下面的兜底 */ }
+  // 局域网 http 访问不是安全上下文，没有 clipboard API：临时 textarea + execCommand 兜底
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = s;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch (e) {
+    return false;
   }
 }
 
-function streamMessage(m) {
-  stopStream();
-  streamMsgId = m.id;
-  const full = String(m.text || '');
-  let i = 0;
-  const step = 2;
-  const interval = 24;
-  const tick = () => {
-    const target = messages.find((x) => x.id === m.id);
-    if (!target || streamMsgId !== m.id) return;
-    i = Math.min(i + step, full.length);
-    const row = $('msgList').querySelector('[data-mid="' + m.id + '"]');
-    if (row) {
-      const b = row.querySelector('.bubble');
-      if (b) b.innerHTML = esc(full.slice(0, i)).replace(/\n/g, '<br>') + '<span class="stream-caret"></span>';
-      scrollToBottom(false);
-    }
-    if (i >= full.length) {
-      streamMsgId = null;
-      streamTimer = null;
-      if (row) {
-        const b = row.querySelector('.bubble');
-        if (b) b.innerHTML = renderMarkdown(full);
-      }
-      scrollToBottom(false);
-      return;
-    }
-    streamTimer = setTimeout(tick, interval);
-  };
-  tick();
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest && e.target.closest('.copy-btn');
+  if (!btn) return;
+  const wrap = btn.closest('.code-wrap');
+  const code = wrap && wrap.querySelector('code');
+  const row = btn.closest('.msg-row');
+  const text = code ? code.textContent
+    : (row && row.dataset.mid ? (messages.find((x) => x.id === row.dataset.mid) || {}).text : '');
+  copyText(text).then((ok) => toast(ok ? '已复制' : '复制失败，请长按选择文本'));
+});
+
+/* ================= 停止当前回合 ================= */
+function stopTurn() {
+  if (!codexBusy) return;
+  socket.emit('stop-turn', {}, (res) => {
+    if (!res || !res.ok) return toast((res && res.reason) || '停止失败');
+    toast(res.dropped ? '已停止，并丢弃 ' + res.dropped + ' 条排队消息' : '已停止当前回合');
+  });
 }
 
 /* ================= 登录 / 初始化 ================= */
@@ -809,7 +823,7 @@ async function logout() {
   activeConvId = null;
   displayedConvId = null;
   codexBusy = false;
-  stopStream();
+  $('stopBtn').classList.add('hidden');
   clearProcess();
   $('typingRow').classList.add('hidden');
   renderChat();
@@ -837,7 +851,17 @@ function sendChat() {
   input.value = '';
   autosize();
   scrollToBottom(true); // 发送后立即滚到底部，露出加载/过程动画
-  socket.emit('chat-message', { text }, (res) => {
+  // socket 半死（挂久了/休眠/切网）时 emit 石沉大海、ack 永不回：超时就恢复输入并重连
+  socket.timeout(15000).emit('chat-message', { text }, (err, res) => {
+    if (err) {
+      input.value = text;
+      autosize();
+      setConn('off');
+      toast('发送超时，内容已放回输入框，正在重连…');
+      socket.disconnect();
+      socket.connect();
+      return;
+    }
     if (!res || !res.ok) {
       toast((res && res.reason) || '发送失败');
       input.value = text;
@@ -867,6 +891,16 @@ socket.on('connect', async () => {
   loadConversations();
 });
 socket.on('disconnect', () => setConn('off'));
+// 手机/笔记本休眠、切网后 socket 会变"假连接"（本地以为连着、实际发不出去）：
+// 回到前台或网络恢复时补一次连接检查
+function ensureSocket() {
+  if (account && !socket.connected) {
+    setConn('off');
+    socket.connect();
+  }
+}
+window.addEventListener('online', ensureSocket);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) ensureSocket(); });
 socket.on('connect_error', (err) => {
   setConn('off');
   if (err && err.message === 'unauthorized') {
@@ -901,14 +935,9 @@ socket.on('model-changed', (p) => {
 socket.on('chat-message', (m) => {
   if (!m || m.text == null) return;
   if (m.conversationId && m.conversationId !== displayedConvId) return;
+  m.live = true; // 本回合实时到达：过程已在过程区展示，气泡内不再重复回放
   mergeMessages([m]);
   renderChat();
-  if (m.stream) {
-    $('typingRow').classList.add('hidden');
-    streamMessage(m);
-  } else {
-    stopStream();
-  }
 });
 
 socket.on('chat-process', (p) => {
@@ -949,6 +978,7 @@ socket.on('conversations', (p) => {
 socket.on('codex-status', (p) => {
   codexBusy = !!(p && p.busy);
   $('typingRow').classList.toggle('hidden', !codexBusy);
+  $('stopBtn').classList.toggle('hidden', !codexBusy);
   scrollToBottom(true);
 });
 
@@ -1199,6 +1229,7 @@ async function boot() {
   $('authUser').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuth(); });
 
   $('sendBtn').onclick = sendChat;
+  $('stopBtn').onclick = stopTurn;
   $('menuBtn').onclick = () => { togglePanel('menuPanel', true); loadModelOptions(); };
   $('menuCloseBtn').onclick = () => togglePanel(null, false);
   $('convCloseBtn').onclick = () => togglePanel(null, false);

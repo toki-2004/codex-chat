@@ -152,6 +152,7 @@ function startServer() {
   });
   proc.stdout.on('data', () => {});
   proc.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
+  proc.on('exit', (code, signal) => console.log('[server exit] code=' + code + ' signal=' + signal));
   return proc;
 }
 
@@ -196,6 +197,21 @@ function waitFor(arr, pred, label, ms) {
     const t0 = Date.now();
     const tick = () => {
       const hit = arr.find(pred);
+      if (hit) return resolve(hit);
+      if (Date.now() - t0 > timeout) return reject(new Error('timeout waiting for ' + label));
+      setTimeout(tick, 40);
+    };
+    tick();
+  });
+}
+
+/* 等"新到"的事件：from 之后出现的第一个匹配（数组只增不减，别传切片快照） */
+function waitForNew(arr, from, pred, label, ms) {
+  const timeout = ms || 10000;
+  const t0 = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const hit = arr.slice(from).find(pred);
       if (hit) return resolve(hit);
       if (Date.now() - t0 > timeout) return reject(new Error('timeout waiting for ' + label));
       setTimeout(tick, 40);
@@ -327,19 +343,29 @@ function stopServer(proc) {
 
     /* ---- S7 chat turn: JSONL parse + persistence ---- */
     console.log('S7 chat turn');
+    // 新连接会立刻补发一次 codex-status，等待必须只看"这条消息之后"的事件
+    const nBusy7 = admin.events['codex-status'].length;
     const ack1 = await ack(adminSock, 'chat-message', { text: 'PING' });
     check('chat-message ack ok', ack1 && ack1.ok === true, ack1);
     const userMsg = await waitFor(admin.events['chat-message'], (m) => m.role === 'user', 'user msg', 5000);
     check('user message broadcast with conversationId', userMsg.conversationId === conv1.id && userMsg.text === 'PING', userMsg);
-    await waitFor(admin.events['codex-status'], (s) => s.busy === true, 'busy', 5000).catch(() => {});
+    await waitForNew(admin.events['codex-status'], nBusy7, (s) => s.busy === true, 'busy', 5000).catch(() => {});
     const agentMsg = await waitFor(admin.events['chat-message'], (m) => m.role === 'agent', 'agent msg', 15000);
     check('agent reply PONG (stub exec path)', agentMsg.text === 'PONG', agentMsg.text);
-    check('agent reply marked stream + routed to conv', agentMsg.stream === true && agentMsg.conversationId === conv1.id, agentMsg);
-    check('turn ends with busy=false', await waitFor(admin.events['codex-status'], (s) => s.busy === false, 'idle', 10000).then(() => true, () => false));
-    const convsFile = JSON.parse(fs.readFileSync(path.join(dataDir, 'conversations.json'), 'utf8'));
-    const conv1Stored = convsFile.conversations.find((c) => c.id === conv1.id);
+    check('agent reply routed to conv (no streaming flag)', agentMsg.stream === undefined && agentMsg.conversationId === conv1.id, agentMsg);
+    check('turn ends with busy=false', await waitForNew(admin.events['codex-status'], nBusy7, (s) => s.busy === false, 'idle', 10000).then(() => true, () => false));
+    // 落盘是异步队列：等线程 id 真写进文件再断言
+    let conv1Stored = null;
+    for (let i = 0; i < 20; i++) {
+      const convsFile = JSON.parse(fs.readFileSync(path.join(dataDir, 'conversations.json'), 'utf8'));
+      conv1Stored = convsFile.conversations.find((c) => c.id === conv1.id);
+      if (conv1Stored && conv1Stored.sessionId) break;
+      await sleep(150);
+    }
     check('thread id persisted', conv1Stored && /^T[0-9a-f]{8}$/.test(conv1Stored.sessionId || ''), conv1Stored && conv1Stored.sessionId);
-    check('first message became title', conv1Stored.title === 'PING', conv1Stored.title);
+    // 首条消息先当占位标题，第一条回复结束后会被 AI 总结覆盖（见 S13b）
+    check('first message seeds the title early',
+      conv1Stored.title === 'PING' || conv1Stored.titleSource === 'ai', conv1Stored.title);
     const thread1 = conv1Stored.sessionId;
 
     /* ---- S8 command_execution process events ---- */
@@ -367,11 +393,12 @@ function stopServer(proc) {
 
     /* ---- S10 resume failure falls back to new thread ---- */
     console.log('S10 resume failure fallback');
+    const nBusy10 = admin.events['codex-status'].length;
     const ack4 = await ack(adminSock, 'chat-message', { text: 'CCX_FAILRESUME' });
     check('failure turn accepted', ack4 && ack4.ok === true, ack4);
     const recovered = await waitFor(admin.events['chat-message'], (m) => m.role === 'agent' && m.text === 'RECOVERED', 'recovered reply', 15000);
     check('requeued turn answered after resume failure', !!recovered);
-    await waitFor(admin.events['codex-status'], (s) => s.busy === false, 'idle after fallback', 10000).catch(() => {});
+    await waitForNew(admin.events['codex-status'], nBusy10, (s) => s.busy === false, 'idle after fallback', 10000).catch(() => {});
     // conversations.json 是异步落盘的：等新线程 id 真的写进去再断言（原来读一次就断言，偶发假失败）
     let conv1c = null;
     for (let i = 0; i < 20; i++) {
@@ -384,6 +411,7 @@ function stopServer(proc) {
 
     /* ---- S11 message length clamp + empty message ---- */
     console.log('S11 input clamps');
+    const nBusy11 = admin.events['codex-status'].length;
     const long = 'A'.repeat(60);
     const ack5 = await ack(adminSock, 'chat-message', { text: long });
     check('oversize message accepted but clamped', ack5 && ack5.ok === true, ack5);
@@ -392,7 +420,7 @@ function stopServer(proc) {
     // 40 个 A 不含任何桩标记 -> 固定回复 'STUB-REPLY ' + 末 30 字符
     const clampedAgentReply = 'STUB-REPLY ' + 'A'.repeat(30);
     await waitFor(admin.events['chat-message'], (m) => m.role === 'agent' && m.text === clampedAgentReply, 'agent for clamped', 15000);
-    await waitFor(admin.events['codex-status'], (s) => s.busy === false, 'idle after clamp turn', 10000).catch(() => {});
+    await waitForNew(admin.events['codex-status'], nBusy11, (s) => s.busy === false, 'idle after clamp turn', 10000).catch(() => {});
     const ackEmpty = await ack(adminSock, 'chat-message', { text: '   ' });
     check('empty message rejected', ackEmpty && ackEmpty.ok === false, ackEmpty);
 
@@ -446,6 +474,94 @@ function stopServer(proc) {
     check('no plaintext alice passwords', usersRaw.indexOf('alice123') < 0 && usersRaw.indexOf('newpass99') < 0);
     check('password hashes stored', usersRaw.indexOf('passwordHash') > 0 && usersRaw.indexOf(':') > 0);
 
+    /* ---- S13b conversation titles: AI summary + manual rename ---- */
+    console.log('S13b conversation titles');
+    const titleCallsIn = (log) => (log.match(/只输出标题本身/g) || []).length;
+    let titled = null;
+    for (let i = 0; i < 40; i++) {
+      const d = JSON.parse(fs.readFileSync(path.join(dataDir, 'conversations.json'), 'utf8'));
+      titled = d.conversations.find((c) => c.id === conv1.id);
+      if (titled && titled.title === 'STUB-AI-TITLE') break;
+      await sleep(200);
+    }
+    check('AI-summarized title replaces the placeholder',
+      !!titled && titled.title === 'STUB-AI-TITLE', titled && titled.title);
+    check('title source marked as ai', !!titled && titled.titleSource === 'ai', titled && titled.titleSource);
+    check('title change broadcast to other devices',
+      admin.events['conversations'].some((p) => (p.conversations || [])
+        .some((c) => c.id === conv1.id && c.title === 'STUB-AI-TITLE')));
+    const logAfterTitle = fs.readFileSync(stubLog, 'utf8');
+    check('title asked in a fresh turn (not a resume)',
+      logAfterTitle.split('\n').some((l) => l.startsWith('CALL ')
+        && l.indexOf('只输出标题本身') > 0 && l.indexOf('"resume"') < 0), logAfterTitle.slice(-200));
+    // 删临时线程是 fire-and-forget 的子进程，给它几秒落日志
+    let deletedSeen = logAfterTitle.split('\n').some((l) => l.startsWith('DELETED '));
+    for (let i = 0; i < 20 && !deletedSeen; i++) {
+      await sleep(150);
+      deletedSeen = fs.readFileSync(stubLog, 'utf8').split('\n').some((l) => l.startsWith('DELETED '));
+    }
+    check('title temp thread deleted right away', deletedSeen, 'no DELETED line within 3s');
+    check('only one title call so far', titleCallsIn(logAfterTitle) === 1, titleCallsIn(logAfterTitle));
+
+    r = await api('PATCH', '/api/conversations/' + conv1.id, { title: '  我自己起的标题。 ' }, adminCookie);
+    check('rename trims and drops trailing punctuation',
+      r.status === 200 && r.json.conversation.title === '我自己起的标题', r.json);
+    check('rename broadcast to other devices',
+      admin.events['conversations'].some((p) => (p.conversations || [])
+        .some((c) => c.id === conv1.id && c.title === '我自己起的标题')));
+    r = await api('PATCH', '/api/conversations/' + conv1.id, { title: '   ' }, adminCookie);
+    check('empty title rejected', r.status === 400, r.status);
+    r = await api('PATCH', '/api/conversations/does-not-exist', { title: 'x' }, adminCookie);
+    check('rename unknown conversation 404', r.status === 404, r.status);
+
+    // 手动改过标题的对话：AI 总结不再覆盖
+    r = await api('POST', '/api/conversations', {}, adminCookie);
+    const conv3 = r.json.conversation;
+    await api('PATCH', '/api/conversations/' + conv3.id, { title: '手动标题保平安' }, adminCookie);
+    const nBusy13 = admin.events['codex-status'].length;
+    await ack(adminSock, 'chat-message', { text: 'PING-TITLE' });
+    await waitFor(admin.events['chat-message'],
+      (m) => m.role === 'agent' && m.conversationId === conv3.id, 'reply for renamed conv', 15000);
+    await waitForNew(admin.events['codex-status'], nBusy13, (s) => s.busy === false, 'idle after renamed turn', 10000).catch(() => {});
+    await sleep(2500); // 给（本该被跳过的）标题任务留出执行时间
+    const conv3Stored = JSON.parse(fs.readFileSync(path.join(dataDir, 'conversations.json'), 'utf8'))
+      .conversations.find((c) => c.id === conv3.id);
+    check('manual title survives the AI summary pass',
+      conv3Stored && conv3Stored.title === '手动标题保平安', conv3Stored && conv3Stored.title);
+    check('no title call for a manually named conversation',
+      titleCallsIn(fs.readFileSync(stubLog, 'utf8')) === 1, titleCallsIn(fs.readFileSync(stubLog, 'utf8')));
+    r = await api('DELETE', '/api/conversations/' + conv3.id, undefined, adminCookie);
+    check('cleanup renamed conversation', r.status === 200, r.status);
+    await api('GET', '/api/conversations/' + conv1.id, undefined, adminCookie); // 还原活跃对话
+
+    /* ---- S13c 停止当前回合（+ 新连接同步忙碌状态） ---- */
+    console.log('S13c stop turn');
+    r = await api('POST', '/api/conversations', {}, adminCookie);
+    const convStop = r.json && r.json.conversation;
+    let nStatus = admin.events['codex-status'].length;
+    await ack(adminSock, 'chat-message', { text: 'CCX_SLOW 慢慢回答' });
+    await waitForNew(admin.events['codex-status'], nStatus, (s) => s.busy === true, 'busy for slow turn', 8000);
+    const ackQ = await ack(adminSock, 'chat-message', { text: 'CCX_SLOW 排队第二条' });
+    check('queued message accepted while busy', ackQ && ackQ.ok === true, ackQ);
+    // 新连接 = 刷新页面/换设备：必须立刻知道正在忙，动画不能丢
+    const late = await connectSocket(adminCookie);
+    const lateBusy = await waitFor(late.events['codex-status'], (s) => s.busy === true, 'busy on connect', 3000);
+    check('new socket learns current busy state on connect', !!lateBusy, late.events['codex-status']);
+    try { late.sock.close(); } catch (e) { /* 忽略 */ }
+    const stopped = await ack(adminSock, 'stop-turn', {});
+    check('stop-turn acks and reports dropped queue', stopped && stopped.ok === true && stopped.dropped === 1, stopped);
+    nStatus = admin.events['codex-status'].length;
+    await waitForNew(admin.events['codex-status'], nStatus, (s) => s.busy === false, 'idle after stop', 15000);
+    check('turn ends after stop',
+      await waitFor(admin.events['chat-message'], (m) => m.role === 'system' && /已停止/.test(m.text || ''), 'stop msg', 5000).then(() => true, () => false));
+    await sleep(1500); // 被杀掉的桩进程若无 taskkill，这段时间足够它把回复吐出来
+    const lateReplies = admin.events['chat-message'].filter((m) => m.role === 'agent' && m.conversationId === convStop.id);
+    check('killed turn and dropped queue never reply', lateReplies.length === 0, lateReplies.map((m) => m.text));
+    const idleStop = await ack(adminSock, 'stop-turn', {});
+    check('stop when idle is rejected', idleStop && idleStop.ok === false, idleStop);
+    r = await api('DELETE', '/api/conversations/' + convStop.id, undefined, adminCookie);
+    check('cleanup stop conversation', r.status === 200, r.status);
+
     /* ---- S14 delete conversation cleans thread ---- */
     console.log('S14 delete conversation');
     r = await api('DELETE', '/api/conversations/' + conv1.id, undefined, adminCookie);
@@ -458,6 +574,26 @@ function stopServer(proc) {
     check('deleted conversation gone from list', r.json.conversations.every((c) => c.id !== conv1.id), r.json.activeId);
     r = await api('DELETE', '/api/conversations/does-not-exist', undefined, adminCookie);
     check('unknown conversation delete 404', r.status === 404, r.status);
+
+    /* ---- S15 会话自动续期（借一次重启把"快过期"状态灌进内存） ---- */
+    console.log('S15 session auto-renewal');
+    const sessionsFile = path.join(dataDir, 'sessions.json');
+    const sessionToken = adminCookie.split('=')[1];
+    const ses0 = JSON.parse(fs.readFileSync(sessionsFile, 'utf8'));
+    check('session persisted with ~7d expiry',
+      ses0[sessionToken] && ses0[sessionToken].expires - Date.now() > 6 * 24 * 3600 * 1000,
+      ses0[sessionToken] && ses0[sessionToken].expires);
+    await stopServer(server);
+    ses0[sessionToken].expires = Date.now() + 3600 * 1000; // 假装有效期已经用掉大半
+    fs.writeFileSync(sessionsFile, JSON.stringify(ses0, null, 2));
+    server = startServer();
+    await waitHealthy();
+    r = await api('GET', '/api/me', undefined, adminCookie);
+    check('session survives restart (still logged in)', r.status === 200 && r.json.user && r.json.user.username === 'admin', r.status);
+    const ses1 = JSON.parse(fs.readFileSync(sessionsFile, 'utf8'));
+    check('near-expiry session is renewed on use',
+      ses1[sessionToken] && ses1[sessionToken].expires - Date.now() > 6 * 24 * 3600 * 1000,
+      ses1[sessionToken] && ses1[sessionToken].expires);
   } catch (e) {
     failures.push('FATAL: ' + e.message);
     console.log('  FATAL ' + e.stack);

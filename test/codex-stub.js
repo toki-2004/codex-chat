@@ -10,7 +10,10 @@
  * Behavior is driven by marker words inside the prompt:
  *   CCX_CMDTEST    -> also emits one command_execution pair (echo hi)
  *   CCX_FAILRESUME -> when resuming, exits 1 with no events (resume fallback)
+ *   CCX_SLOW       -> stalls 20s before replying (lets the tests hit "stop")
+ *   CCX_MD         -> replies with markdown + a fenced code block
  *   PING           -> replies "PONG"
+ *   title prompt (server.js generateConversationTitle) -> replies "STUB-AI-TITLE"
  * Every invocation is appended (one line, JSON) to $CCX_STUB_LOG when set.
  * ------------------------------------------------------------------------- */
 
@@ -69,12 +72,23 @@ if (prompt.indexOf('CCX_CMDTEST') >= 0) {
 
 const reply = (() => {
   if (prompt.indexOf('CCX_FAILRESUME') >= 0) return 'RECOVERED';
+  if (prompt.indexOf('只输出标题本身') >= 0) return 'STUB-AI-TITLE';
   if (prompt.indexOf('PING') >= 0) return isResume ? 'RESUMED-PONG' : 'PONG';
+  if (prompt.indexOf('CCX_SLOW') >= 0) return 'SLOW-DONE';
+  if (prompt.indexOf('CCX_MD') >= 0) return '**粗体**\n\n```js\nconsole.log(1);\n```\n\n结束';
   return 'STUB-REPLY ' + String(prompt).slice(-30);
 })();
 
-if (!isResume) {
-  emit({ type: 'thread.started', thread_id: 'T' + crypto.randomBytes(4).toString('hex') });
+if (prompt.indexOf('CCX_SLOW') >= 0) {
+  // 拖 20 秒才出结论：给"停止"测试留出足够的时间窗（被 taskkill 时进程直接消失）
+  setTimeout(() => {
+    emit({ type: 'item.completed', item: { type: 'agent_message', text: reply } });
+    process.exit(0);
+  }, 20000);
+} else {
+  if (!isResume) {
+    emit({ type: 'thread.started', thread_id: 'T' + crypto.randomBytes(4).toString('hex') });
+  }
+  emit({ type: 'item.completed', item: { type: 'agent_message', text: reply } });
+  process.exit(0);
 }
-emit({ type: 'item.completed', item: { type: 'agent_message', text: reply } });
-process.exit(0);

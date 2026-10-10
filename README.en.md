@@ -13,21 +13,24 @@ Each conversation maps to an independent Codex session (thread). Only one conver
 - Codex runs with your machine's default configuration (`~/.codex/config.toml`) and automatically reads the skills under `~/.codex/skills/`, preserving your existing habits and preferences;
 - The working root is a real project directory on your machine (default `D:\pythonitems`); Codex can read and write all projects, files, and the environment on that machine, regardless of which client you use;
 - Sessions are persisted and survive service restarts (`codex exec resume` continues the conversation).
-- Replies appear progressively with a **typewriter streaming effect** (the current DeepSeek provider returns whole messages and the CLI emits no incremental events, so this is client-side progressive display; the code is already compatible with future delta streaming events).
+- Each reply is **rendered as Markdown the moment it arrives** (text and code blocks come out correct immediately); while Codex is working the UI shows a "working" animation whose state is pushed by the server, so it stays accurate across reloads and devices.
 
 ## Features
 
 - **Multi-conversation management**: create, switch, and delete conversations; each has its own context and Codex thread.
+- **Conversation titles**: after a conversation's first reply, Codex summarizes a short title for it automatically; you can also rename any conversation with the ✎ button in the conversation list (a manually set title is never overwritten by the summary).
 - **Single active session**: only one active conversation at a time, shared across devices — keep asking follow-ups like a chat and let Codex modify local files for you.
-- **Streaming display**: Codex replies render progressively with a typewriter effect instead of just a loading animation.
+- **Replies render instantly**: a Codex reply lands in its final form — Markdown text and code blocks at once (no per-character animation, so long replies never end up half-rendered).
+- **Copy buttons**: every message and every code block has a "copy" button; when the page is opened over plain http on a LAN a fallback path kicks in, so phones can copy with one tap too.
+- **Stop at any time**: a "stop" button appears next to the input while a reply is running; clicking it aborts the current turn and drops the queued messages.
 - **Live execution visibility**: every command Codex runs is shown in real time with its command, output, and exit code, alongside streaming process text; after the turn ends it can be expanded and replayed — you see the process, not just the result.
 - **Message queueing**: messages sent while Codex is replying are queued automatically and processed in order once the reply finishes; nothing is lost.
 - **No reply timeout**: reply duration is unlimited by default (`turnTimeoutMs: 0`), so long tasks are never cut off midway.
-- **Account login**: create an administrator account on first launch, after which all usage requires signing in; the admin can add/remove users and reset passwords in the UI, and regular users can change their own password. Passwords are stored as scrypt salted hashes, never in plain text.
+- **Account login**: create an administrator account on first launch, after which all usage requires signing in; the admin can add/remove users and reset passwords in the UI, and regular users can change their own password. Passwords are stored as scrypt salted hashes, never in plain text. Sessions last 7 days by default and are extended automatically while in use (renewed once half the lifetime is spent), so you are not kicked back to the login page mid-conversation.
 - **Switch API and model on the fly**: profiles and models can be switched from the menu panel; changes sync to all devices in real time and are persisted to `config.json`, taking effect on the next reply. Profiles are `~/.codex/*.config.toml` files (e.g. the `zcode.config.toml` layered in by `codex -p zcode`) and are discovered by automatic scanning; model candidates are read automatically from the current configuration's `model_catalog_json` (the default profile reads the `models.json` referenced by `~/.codex/config.toml`, and the zcode profile reads `zcode-models.json`). The API is decided entirely by the profile: the default profile keeps `~/.codex/config.toml`, and choosing the zcode profile routes to BigModel — no default configuration is modified.
 - **Live model list refresh**: the "↻ Refresh" button next to the model dropdown asks the current profile's provider for its real `/models` list (provider and key come from that profile's `model_provider` / `[model_providers.<name>]`; the key is only used for that request — never logged, never sent to the browser). Switching profiles refreshes automatically as well. If the request fails (timeout / 401 / offline) the dropdown never goes empty: it falls back to the local catalog and shows the reason underneath.
 - **Same capabilities as the CLI**: reads skills, follows AGENTS.md/HANDOVER.md conventions, uses local tools such as git/gh/node, and inherits your model and account configuration.
-- **Real-time sync**: every device sees the message stream and the list of online devices live; a typing indicator appears while Codex is busy.
+- **Real-time sync**: every device sees the message stream and the list of online devices live; a working animation appears while Codex is busy, and any new connection (page reload, another device) syncs the current busy state right away.
 - **Mobile-first**: a full-screen chat UI adapted to phone safe areas; no app installation required.
 
 ## Quick Start
@@ -87,7 +90,7 @@ Tip: drop a file such as `zcode.config.toml` into `~/.codex/` and it becomes dir
 
 1. Any device sends a message → it is written to the active conversation's JSON and broadcast (a conversation is created automatically if none exists);
 2. If Codex is idle, it runs `codex exec --json -C <cwd> --dangerously-bypass-approvals-and-sandbox` (first message of a conversation, injecting the system prompt + message) or `codex exec resume <thread_id> --json --dangerously-bypass-approvals-and-sandbox` (continuation; the sandbox flag must be passed explicitly every time, otherwise it falls back to the default read-only sandbox);
-3. The server parses JSONL events: the `thread_id` from `thread.started` is persisted to the corresponding conversation (`data/conversations.json`); `command_execution` commands/output are broadcast in real time as `chat-process` so the frontend can show the execution process; replies are broadcast via Socket.io (with a streaming flag and process replay, displayed by the frontend as a typewriter);
+3. The server parses JSONL events: the `thread_id` from `thread.started` is persisted to the corresponding conversation (`data/conversations.json`); `command_execution` commands/output are broadcast in real time as `chat-process` so the frontend can show the execution process; replies are broadcast via Socket.io (whole Markdown plus process replay);
 4. Messages are processed strictly serially (first in, first out); if resuming fails (session expired), a new thread is opened automatically for that conversation.
 
 ## Security Notes
