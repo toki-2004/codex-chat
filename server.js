@@ -321,7 +321,8 @@ function findUserByUsername(username) {
 }
 
 function userPublic(u) {
-  return { id: u.id, username: u.username, displayName: u.displayName || u.username, role: u.role, createdAt: u.createdAt };
+  // userId 与 /api/me 的会话对象同名字段保持一致（前端一律读 account.userId，只有 id 会导致登录后"我"/自己消息失效）
+  return { id: u.id, userId: u.id, username: u.username, displayName: u.displayName || u.username, role: u.role, createdAt: u.createdAt };
 }
 
 function createSession(user) {

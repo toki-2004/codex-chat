@@ -21,7 +21,7 @@ Each conversation maps to an independent Codex session (thread). Only one conver
 - **Conversation titles**: after a conversation's first reply, Codex summarizes a short title for it automatically; you can also rename any conversation with the ✎ button in the conversation list (a manually set title is never overwritten by the summary).
 - **Single active session**: only one active conversation at a time, shared across devices — keep asking follow-ups like a chat and let Codex modify local files for you.
 - **Replies render instantly**: a Codex reply lands in its final form — Markdown text and code blocks at once (no per-character animation, so long replies never end up half-rendered).
-- **Copy buttons**: every message and every code block has a "copy" button; when the page is opened over plain http on a LAN a fallback path kicks in, so phones can copy with one tap too.
+- **Copy buttons**: every code block has one at its top-right corner and every message has one at its tail (bottom-right); when the page is opened over plain http on a LAN a fallback path kicks in, so phones can copy with one tap too.
 - **Stop at any time**: a "stop" button appears next to the input while a reply is running; clicking it aborts the current turn and drops the queued messages.
 - **Live execution visibility**: every command Codex runs is shown in real time with its command, output, and exit code, alongside streaming process text; after the turn ends it can be expanded and replayed — you see the process, not just the result.
 - **Message queueing**: messages sent while Codex is replying are queued automatically and processed in order once the reply finishes; nothing is lost.
@@ -31,7 +31,7 @@ Each conversation maps to an independent Codex session (thread). Only one conver
 - **Live model list refresh**: the "↻ Refresh" button next to the model dropdown asks the current profile's provider for its real `/models` list (provider and key come from that profile's `model_provider` / `[model_providers.<name>]`; the key is only used for that request — never logged, never sent to the browser). Switching profiles refreshes automatically as well. If the request fails (timeout / 401 / offline) the dropdown never goes empty: it falls back to the local catalog and shows the reason underneath.
 - **Same capabilities as the CLI**: reads skills, follows AGENTS.md/HANDOVER.md conventions, uses local tools such as git/gh/node, and inherits your model and account configuration.
 - **Real-time sync**: every device sees the message stream and the list of online devices live; a working animation appears while Codex is busy, and any new connection (page reload, another device) syncs the current busy state right away.
-- **Mobile-first**: a full-screen chat UI adapted to phone safe areas; no app installation required.
+- **Mobile-first, desktop-aware**: a full-screen chat UI adapted to phone safe areas that widens its column and scales up type on laptops and desktops; no app installation required.
 
 ## Quick Start
 
