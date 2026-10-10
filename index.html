@@ -154,7 +154,7 @@ body {
 
 /* ---------- 输入栏 ---------- */
 .input-bar {
-  flex: none; display: flex; align-items: flex-end; gap: 8px;
+  flex: none; position: relative; display: flex; align-items: flex-end; gap: 8px;
   padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   background: var(--card); border-top: 1px solid var(--line);
 }
@@ -307,6 +307,15 @@ body {
   max-width: 86vw; text-align: center;
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* 「有新消息 ↓」：用户在翻旧记录时才出现（见 follow 状态机） */
+.new-hint {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  bottom: calc(100% + 8px); z-index: 20;   /* 贴着输入栏上沿，自动跟着栏高/安全区走 */
+  border: 1px solid var(--accent); background: var(--card); color: var(--accent);
+  border-radius: 999px; padding: 6px 14px; font-size: 12px; cursor: pointer;
+  box-shadow: var(--shadow); font-family: inherit;
+}
 </style>
 </head>
 <body>
@@ -348,6 +357,7 @@ body {
   </main>
 
   <footer class="input-bar">
+    <button class="new-hint hidden" id="newHint">有新消息 ↓</button>
     <textarea id="chatInput" rows="1" placeholder="给本机 Codex 发消息，Enter 发送" autocomplete="off"></textarea>
     <button class="stop-btn hidden" id="stopBtn" title="停止当前回复">停止</button>
     <button class="send-btn" id="sendBtn" title="发送">➤</button>
@@ -529,10 +539,62 @@ function renderChat() {
   scrollToBottom(false);
 }
 
-function scrollToBottom(force) {
+/* ================= 自动贴底（同 desktop-pet-ai 网页聊天的 follow 状态机） ================= */
+// 每次输出都拉到最下面；只有"用户主动往上翻、视口下方还有 3 条以上"时才不打扰，只提示有新消息。
+// 旧实现是"离底部 <120px 才跟"，滚轮稍微一滑就再也不跟了。
+let follow = true;
+let ignoreScrollUntil = 0;   // 自己滚动引起的 scroll 事件别当成"用户在翻记录"
+let settleTimer = 0;
+const KEEP_FOLLOW_MAX_BELOW = 3;
+
+function messagesBelow() {
   const el = $('chatMain');
-  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-  if (force || nearBottom) el.scrollTop = el.scrollHeight;
+  const limit = el.getBoundingClientRect().bottom + 4;
+  const rows = el.querySelectorAll('#msgList .msg-row');
+  let n = 0;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].getBoundingClientRect().bottom > limit) n++;
+    else break;
+  }
+  return n;
+}
+
+function toBottom() {
+  const el = $('chatMain');
+  ignoreScrollUntil = Date.now() + 400;
+  el.scrollTop = el.scrollHeight;
+}
+
+// 只贴一次不够：长文本换行、过程块出现/收起都会让内容继续变高，所以连贴几帧再补两次
+function scrollToBottom(force) {
+  if (force) follow = true;
+  if (!follow) return;
+  toBottom();
+  requestAnimationFrame(() => { if (follow) toBottom(); });
+  clearTimeout(settleTimer);
+  settleTimer = setTimeout(() => { if (follow) toBottom(); }, 80);
+  setTimeout(() => { if (follow) toBottom(); }, 300);
+}
+
+function hintNew() {
+  if (!follow) $('newHint').classList.remove('hidden');
+}
+
+$('chatMain').addEventListener('scroll', () => {
+  if (Date.now() < ignoreScrollUntil) return;
+  follow = messagesBelow() <= KEEP_FOLLOW_MAX_BELOW;
+  if (follow) $('newHint').classList.add('hidden');
+});
+$('newHint').addEventListener('click', () => {
+  $('newHint').classList.add('hidden');
+  scrollToBottom(true);
+});
+if (window.visualViewport) {   // 手机键盘弹收会改视口，跟随状态下保持贴底
+  window.visualViewport.addEventListener('resize', () => scrollToBottom(false));
+}
+if (window.ResizeObserver) {   // 内容变高（过程块新增/收起）时继续贴底
+  const ro = new ResizeObserver(() => scrollToBottom(false));
+  ['msgList', 'processArea', 'typingRow'].forEach((id) => ro.observe($(id)));
 }
 
 function mergeMessages(incoming) {
@@ -569,6 +631,7 @@ function renderProcessBlocks() {
     return '';
   }).join('');
   scrollToBottom(false);
+  hintNew();   // 正在翻旧记录时，新进度只提示不打扰
 }
 
 function addProcessBlock(b) {
@@ -967,6 +1030,7 @@ socket.on('chat-message', (m) => {
   m.live = true; // 本回合实时到达：过程已在过程区展示，气泡内不再重复回放
   mergeMessages([m]);
   renderChat();
+  hintNew();
 });
 
 socket.on('chat-process', (p) => {
@@ -1008,7 +1072,9 @@ socket.on('codex-status', (p) => {
   codexBusy = !!(p && p.busy);
   $('typingRow').classList.toggle('hidden', !codexBusy);
   $('stopBtn').classList.toggle('hidden', !codexBusy);
-  scrollToBottom(true);
+  // 不强制贴底：别的设备发起的回合不该把正在翻记录的人拽回底部（跟随状态下照样贴底）
+  scrollToBottom(false);
+  hintNew();
 });
 
 socket.on('members', (list) => {
