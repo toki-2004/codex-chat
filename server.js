@@ -549,6 +549,7 @@ function generateConversationTitle(convId) {
             setSession: (id) => { threadId = id; },
             addDelta: (t) => { text += t; },
             setText: (t) => { text = t; },
+            onTurnComplete: () => { killProcTree(proc); done(); },
           });
         }
       });
@@ -558,7 +559,7 @@ function generateConversationTitle(convId) {
 
     // 单线会话：等聊天回合跑完再起标题（最多等 60 秒，之后照样跑）
     const waitIdle = () => {
-      if (state.busy && Date.now() - startedAt < 60000) return setTimeout(waitIdle, 1000);
+      if (isBusyConv(convId) && Date.now() - startedAt < 60000) return setTimeout(waitIdle, 1000);
       spawnTitle();
     };
     waitIdle();
@@ -611,6 +612,7 @@ function deleteConversation(id) {
   const data = getConversations();
   const idx = data.conversations.findIndex((c) => c.id === id);
   if (idx < 0) return false;
+  turnStates.delete(id); // 对话没了，它的队列状态也一起清掉（否则一直挂在 Map 里）
   const [conv] = data.conversations.splice(idx, 1);
   if (data.activeId === conv.id) {
     const rest = [...data.conversations].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
@@ -918,7 +920,7 @@ app.delete('/api/conversations/:id', requireAuth, (req, res) => {
   const data = getConversations();
   const target = data.conversations.find((c) => c.id === id);
   if (!target) return res.status(404).json({ error: '对话不存在' });
-  if (state.busy && data.activeId === id) {
+  if (isBusyConv(id)) {
     return res.status(409).json({ error: '该对话正在回复中，请稍后再删除' });
   }
   deleteConversation(id);
@@ -985,7 +987,9 @@ io.on('connection', (socket) => {
     sandbox: config.sandbox,
     maxMessageLen: MAX_MESSAGE_LEN,
   }});
-  socket.emit('codex-status', { busy: state.busy }); // 刷新/新设备立刻拿到真实忙碌状态
+  // 刷新/新设备立刻拿到真实状态的忙碌对话列表
+  const busyNow = busyConvIds();
+  socket.emit('codex-status', { busy: busyNow.length > 0, conversations: busyNow });
 
   socket.on('set-user', (payload, ack) => {
     const doAck = typeof ack === 'function' ? ack : () => {};
@@ -1002,7 +1006,7 @@ io.on('connection', (socket) => {
 
   socket.on('stop-turn', (payload, ack) => {
     const doAck = typeof ack === 'function' ? ack : () => {};
-    doAck(stopCurrentTurn());
+    doAck(stopCurrentTurn(String((payload && payload.conversationId) || '')));
   });
 
   socket.on('chat-message', (payload, ack) => {
@@ -1011,7 +1015,10 @@ io.on('connection', (socket) => {
     const text = String((payload && payload.text) || '').trim().slice(0, MAX_MESSAGE_LEN);
     if (!text) return doAck({ ok: false, reason: '消息不能为空' });
 
-    let conv = getActiveConversation();
+    // 消息发给"客户端正在看的那个对话"，其它对话在跑也不影响；没带 id 时回落当前活跃对话
+    const asked = String((payload && payload.conversationId) || '');
+    let conv = (asked && getConversations().conversations.find((c) => c.id === asked))
+      || getActiveConversation();
     if (!conv) conv = createConversation();
     // 第一条消息自动作为对话标题
     if (conv.messages.length === 0 && (conv.title === '新对话' || !conv.title)) {
@@ -1042,9 +1049,23 @@ io.on('connection', (socket) => {
 });
 
 /* ---------------------------------------------------------------------------
- * Codex 桥接：全局一条会话，消息串行排队处理
+ * Codex 桥接：每个对话各自一条会话（各自排队、各自一个进程），互不阻塞
  * ------------------------------------------------------------------------- */
-const state = { busy: false, queue: [], proc: null, stop: false };
+const turnStates = new Map(); // convId -> { busy, queue, proc, stop }
+
+function turnState(convId) {
+  let st = turnStates.get(convId);
+  if (!st) {
+    st = { busy: false, queue: [], proc: null, stop: false };
+    turnStates.set(convId, st);
+  }
+  return st;
+}
+
+function isBusyConv(convId) {
+  const st = turnStates.get(convId);
+  return !!(st && st.busy);
+}
 
 /* Windows 下 codex 通常是 npm 安装的 .cmd 包装，Node spawn 直接执行会 ENOENT；
  * 优先解析到 @openai/codex 的 JS 入口，用 node 直接启动 */
@@ -1085,43 +1106,55 @@ function resolveCodexExec() {
   return codexExec;
 }
 
-function broadcastCodexStatus(busy) {
-  io.emit('codex-status', { busy });
+function busyConvIds() {
+  const busy = [];
+  turnStates.forEach((st, id) => { if (st.busy) busy.push(id); });
+  return busy;
 }
 
-/* 停止当前回合：丢弃排队消息并杀掉正在跑的 codex 进程（退出经 close 收尾） */
-function stopCurrentTurn() {
-  if (!state.busy) return { ok: false, reason: '当前没有正在运行的回合' };
-  const dropped = state.queue.length;
-  state.queue.length = 0;
-  state.stop = true;
-  killProcTree(state.proc);
+/* 广播"哪些对话正在回复"的权威快照：客户端只给正在回复的那个对话显示加载动画。
+ * busy 仍保留"有没有人在跑"的布尔值，让已经打开的旧页面不至于卡在加载动画上 */
+function broadcastCodexStatus() {
+  const busy = busyConvIds();
+  io.emit('codex-status', { busy: busy.length > 0, conversations: busy });
+}
+
+/* 停止某个对话的当前回合：丢弃其排队消息并杀掉它的 codex 进程（退出经 close 收尾） */
+function stopCurrentTurn(convId) {
+  const st = turnStates.get(convId);
+  if (!st || !st.busy) return { ok: false, reason: '该对话没有正在运行的回合' };
+  const dropped = st.queue.length;
+  st.queue.length = 0;
+  st.stop = true;
+  killProcTree(st.proc);
   return { ok: true, dropped };
 }
 
 function enqueueCodexTurn(msg, convId) {
   // 总是入队：busy 时由正在运行的 processCodexQueue 循环继续消费，
   // 修复旧逻辑 busy 时直接 return 导致消息被静默丢弃（不回复、模型收不到）。
-  state.queue.push({ msg, convId });
-  if (state.busy) return;
-  state.busy = true;
-  processCodexQueue()
+  const st = turnState(convId);
+  st.queue.push({ msg, convId });
+  if (st.busy) return;
+  st.busy = true;
+  processCodexQueue(convId)
     .catch((e) => {
       console.error('[codex] 队列异常：' + e.message);
     })
     .finally(() => {
-      state.busy = false;
-      state.proc = null;
-      state.stop = false;
-      broadcastCodexStatus(false);
+      st.busy = false;
+      st.proc = null;
+      st.stop = false;
+      broadcastCodexStatus();
     });
 }
 
-async function processCodexQueue() {
-  while (!state.stop) { // 已点停止：排队中的消息不再执行
-    const next = state.queue.shift();
+async function processCodexQueue(convId) {
+  const st = turnState(convId);
+  while (!st.stop) { // 已点停止：排队中的消息不再执行
+    const next = st.queue.shift();
     if (!next) return;
-    broadcastCodexStatus(true);
+    broadcastCodexStatus();
     await runCodexTurn(next.msg, next.convId);
   }
 }
@@ -1176,7 +1209,7 @@ function runCodexTurn(msg, convId) {
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: exec.shell,
     });
-    state.proc = proc;
+    turnState(conv.id).proc = proc;
 
     let stdoutBuf = '';
     let stderrTail = '';
@@ -1271,6 +1304,14 @@ function runCodexTurn(msg, convId) {
             processItems.push({ type: 'text', text: t });
             emitProcess({ type: 'text', text: t });
           },
+          // codex 说这一轮结束（turn.completed）就算回合结束：进程退出可能滞后好几秒，
+          // 偶尔干脆不退（用户遇到过"结论已出、动画还在转、后续消息永远排队"）。
+          // 结束挂在 close 上不可靠，拿到结论就收尾，并杀掉滞留进程。
+          onTurnComplete: () => {
+            if (!agentText) return; // 没拿到回复文本：交给 close 分支按错误处理
+            finish(agentText, null);
+            killProcTree(proc);
+          },
         });
       }
     });
@@ -1293,7 +1334,7 @@ function runCodexTurn(msg, convId) {
         return;
       }
       // 用户按了停止：进程是我们杀的，不当失败、也不重开线程重试
-      if (state.stop) {
+      if (turnState(conv.id).stop) {
         finish(null, '已停止当前回合。');
         return;
       }
@@ -1305,7 +1346,7 @@ function runCodexTurn(msg, convId) {
         conv.sessionId = null;
         saveConversations();
         resolve();
-        state.queue.unshift({ msg, convId: conv.id }); // 放回队首，保持顺序
+        turnState(conv.id).queue.unshift({ msg, convId: conv.id }); // 放回队首，保持顺序
         return;
       }
       finish(null, 'Codex 调用失败（退出码 ' + code + '）：' + tail);
@@ -1324,6 +1365,10 @@ function handleCodexEvent(line, ctx) {
 
   if (type === 'thread.started' && ev.thread_id) {
     ctx.setSession(String(ev.thread_id));
+    return;
+  }
+  if (type === 'turn.completed') {
+    if (ctx.onTurnComplete) ctx.onTurnComplete();
     return;
   }
   if (type === 'item.started' && ev.item && ev.item.type === 'agent_message') {

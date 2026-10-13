@@ -4,11 +4,12 @@
 
 Self-hosted remote chat for Codex: it turns the Codex CLI installed on your machine into a web chat service. Phones, tablets, and any computer on the same LAN (or via port forwarding) can talk to your local Codex from a browser, with the same feel as using the Codex CLI directly.
 
-## Design Principle: Multiple Conversations, One Active Session
+## Design Principle: Multiple Conversations, One Session Per Conversation
 
-Each conversation maps to an independent Codex session (thread). Only one conversation is active at a time, and all devices share the currently active conversation — just like talking to Codex directly:
+Each conversation maps to an independent Codex session (thread) with its own queue and its own Codex process: while one conversation is replying you can switch to another one and keep chatting, and several conversations can run at the same time:
 
 - Messages sent from any device go into the Codex session of the currently active conversation, and replies are broadcast in real time to all online devices;
+- Conversations never block each other: a long task in one of them does not hold up the others, and the working animation only follows the conversation that is actually replying;
 - **Conversations can be created / switched / renamed / deleted**: creating a conversation opens a brand-new Codex thread; deleting one cleans up both the local record and the corresponding Codex thread; titles are summarized by the AI (and can be renamed by hand);
 - Codex runs with your machine's default configuration (`~/.codex/config.toml`) and automatically reads the skills under `~/.codex/skills/`, preserving your existing habits and preferences;
 - The working root is a real project directory on your machine (default `D:\pythonitems`); Codex can read and write all projects, files, and the environment on that machine, regardless of which client you use;
@@ -19,7 +20,7 @@ Each conversation maps to an independent Codex session (thread). Only one conver
 
 - **Multi-conversation management**: create, switch, and delete conversations; each has its own context and Codex thread.
 - **Conversation titles**: after a conversation's first reply, Codex summarizes a short title for it automatically; you can also rename any conversation with the ✎ button in the conversation list (a manually set title is never overwritten by the summary).
-- **Single active session**: only one active conversation at a time, shared across devices — keep asking follow-ups like a chat and let Codex modify local files for you.
+- **Conversations in parallel**: each conversation has its own Codex session and queue, so while one is running you can keep sending messages in another one; within a single conversation messages stay strictly first-in, first-out.
 - **Replies render instantly**: a Codex reply lands in its final form — Markdown text and code blocks at once (no per-character animation, so long replies never end up half-rendered).
 - **Copy buttons**: every code block has one at its top-right corner and every message has one at its tail (bottom-right); when the page is opened over plain http on a LAN a fallback path kicks in, so phones can copy with one tap too.
 - **Stop at any time**: a "stop" button appears next to the input while a reply is running; clicking it aborts the current turn and drops the queued messages.
@@ -31,7 +32,7 @@ Each conversation maps to an independent Codex session (thread). Only one conver
 - **Switch API and model on the fly**: profiles and models can be switched from the menu panel; changes sync to all devices in real time and are persisted to `config.json`, taking effect on the next reply. Profiles are `~/.codex/*.config.toml` files (e.g. the `zcode.config.toml` layered in by `codex -p zcode`) and are discovered by automatic scanning; model candidates are read automatically from the current configuration's `model_catalog_json` (the default profile reads the `models.json` referenced by `~/.codex/config.toml`, and the zcode profile reads `zcode-models.json`). The API is decided entirely by the profile: the default profile keeps `~/.codex/config.toml`, and choosing the zcode profile routes to BigModel — no default configuration is modified.
 - **Live model list refresh**: the "↻ Refresh" button next to the model dropdown asks the current profile's provider for its real `/models` list (provider and key come from that profile's `model_provider` / `[model_providers.<name>]`; the key is only used for that request — never logged, never sent to the browser). Switching profiles refreshes automatically as well. If the request fails (timeout / 401 / offline) the dropdown never goes empty: it falls back to the local catalog and shows the reason underneath.
 - **Same capabilities as the CLI**: reads skills, follows AGENTS.md/HANDOVER.md conventions, uses local tools such as git/gh/node, and inherits your model and account configuration.
-- **Real-time sync**: every device sees the message stream and the list of online devices live; a working animation appears while Codex is busy, and any new connection (page reload, another device) syncs the current busy state right away.
+- **Real-time sync**: every device sees the message stream and the list of online devices live; the working animation belongs to the conversation that is actually replying (other conversations are unaffected and immediately usable), and any new connection (page reload, another device) syncs the per-conversation busy state right away.
 - **Mobile-first, desktop-aware**: a full-screen chat UI adapted to phone safe areas that widens its column and scales up type on laptops and desktops; no app installation required.
 
 ## Quick Start
@@ -92,7 +93,7 @@ Tip: drop a file such as `zcode.config.toml` into `~/.codex/` and it becomes dir
 1. Any device sends a message → it is written to the active conversation's JSON and broadcast (a conversation is created automatically if none exists);
 2. If Codex is idle, it runs `codex exec --json -C <cwd> --dangerously-bypass-approvals-and-sandbox` (first message of a conversation, injecting the system prompt + message) or `codex exec resume <thread_id> --json --dangerously-bypass-approvals-and-sandbox` (continuation; the sandbox flag must be passed explicitly every time, otherwise it falls back to the default read-only sandbox);
 3. The server parses JSONL events: the `thread_id` from `thread.started` is persisted to the corresponding conversation (`data/conversations.json`); `command_execution` commands/output are broadcast in real time as `chat-process` so the frontend can show the execution process; replies are broadcast via Socket.io (whole Markdown plus process replay);
-4. Messages are processed strictly serially (first in, first out); if resuming fails (session expired), a new thread is opened automatically for that conversation.
+4. Within one conversation messages are processed strictly serially (first in, first out), while different conversations run on their own and never block each other; a turn ends on the CLI's `turn.completed` event (not on process exit, so a lagging process cannot leave the animation spinning); if resuming fails (session expired), a new thread is opened automatically for that conversation.
 
 ## Security Notes
 
@@ -132,7 +133,7 @@ npm install   # 含开发依赖 socket.io-client
 npm test
 ```
 
-The tests spin up a temporary service instance under `_test_temp/` with its own port and data directory (leaving the production service on port 3100 untouched), and replace the codex CLI via the `CCX_CODEX_JS` hook with the `test/codex-stub.js` stub script (faking `exec`/`resume`/`delete`/`--version` according to the JSONL protocol), covering 107 assertions across account and Socket authentication, multi-conversation management, JSONL event parsing, command process broadcasting, resume and failure fallback, message truncation, profile/model switching, conversation titles (AI summary + manual rename), persistence safety, stopping a running turn, session auto-renewal, and deletion cleanup.
+The tests spin up a temporary service instance under `_test_temp/` with its own port and data directory (leaving the production service on port 3100 untouched), and replace the codex CLI via the `CCX_CODEX_JS` hook with the `test/codex-stub.js` stub script (faking `exec`/`resume`/`delete`/`--version` according to the JSONL protocol), covering 120 assertions across account and Socket authentication, multi-conversation management, JSONL event parsing, command process broadcasting, resume and failure fallback, message truncation, profile/model switching, conversation titles (AI summary + manual rename), persistence safety, running several conversations in parallel (one busy while another replies), ending a turn at `turn.completed`, stopping a running turn, session auto-renewal, and deletion cleanup.
 
 ## License
 

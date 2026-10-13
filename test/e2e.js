@@ -222,6 +222,10 @@ function waitForNew(arr, from, pred, label, ms) {
 
 const ack = (sock, event, payload) => new Promise((resolve) => sock.emit(event, payload, resolve));
 
+/* codex-status 带着"哪些对话在回复"的列表；单对话用例看 busy 布尔值够用，
+ * 多对话并行用例要看列表本身 */
+const busyIds = (s) => (s && Array.isArray(s.conversations) ? s.conversations : []);
+
 /* ---------------- cleanup ---------------- */
 function stopServer(proc) {
   return new Promise((resolve) => {
@@ -548,7 +552,7 @@ function stopServer(proc) {
     const lateBusy = await waitFor(late.events['codex-status'], (s) => s.busy === true, 'busy on connect', 3000);
     check('new socket learns current busy state on connect', !!lateBusy, late.events['codex-status']);
     try { late.sock.close(); } catch (e) { /* 忽略 */ }
-    const stopped = await ack(adminSock, 'stop-turn', {});
+    const stopped = await ack(adminSock, 'stop-turn', { conversationId: convStop.id });
     check('stop-turn acks and reports dropped queue', stopped && stopped.ok === true && stopped.dropped === 1, stopped);
     nStatus = admin.events['codex-status'].length;
     await waitForNew(admin.events['codex-status'], nStatus, (s) => s.busy === false, 'idle after stop', 15000);
@@ -557,10 +561,57 @@ function stopServer(proc) {
     await sleep(1500); // 被杀掉的桩进程若无 taskkill，这段时间足够它把回复吐出来
     const lateReplies = admin.events['chat-message'].filter((m) => m.role === 'agent' && m.conversationId === convStop.id);
     check('killed turn and dropped queue never reply', lateReplies.length === 0, lateReplies.map((m) => m.text));
-    const idleStop = await ack(adminSock, 'stop-turn', {});
+    const idleStop = await ack(adminSock, 'stop-turn', { conversationId: convStop.id });
     check('stop when idle is rejected', idleStop && idleStop.ok === false, idleStop);
     r = await api('DELETE', '/api/conversations/' + convStop.id, undefined, adminCookie);
     check('cleanup stop conversation', r.status === 200, r.status);
+
+    /* ---- S13d 多对话并行：一个对话在跑，另一个对话照常回复 ---- */
+    console.log('S13d concurrent conversations');
+    r = await api('POST', '/api/conversations', {}, adminCookie);
+    const convA = r.json && r.json.conversation;
+    let nConc = admin.events['codex-status'].length;
+    await ack(adminSock, 'chat-message', { text: 'CCX_SLOW 甲对话慢跑' });
+    await waitForNew(admin.events['codex-status'], nConc, (s) => busyIds(s).includes(convA.id), 'busy for conv A', 8000);
+    r = await api('POST', '/api/conversations', {}, adminCookie);
+    const convB = r.json && r.json.conversation;
+    nConc = admin.events['codex-status'].length;
+    const ackB = await ack(adminSock, 'chat-message', { text: 'PING', conversationId: convB.id });
+    check('message in another conversation accepted while first is busy', ackB && ackB.ok === true, ackB);
+    const replyB = await waitFor(admin.events['chat-message'], (m) => m.role === 'agent' && m.conversationId === convB.id, 'reply in conv B', 8000);
+    check('second conversation answers while the first is still running', replyB.text === 'PONG', replyB.text);
+    check('both conversations are busy at the same time',
+      await waitForNew(admin.events['codex-status'], nConc, (s) => busyIds(s).length === 2, 'both busy', 5000).then(() => true, () => false),
+      admin.events['codex-status'].slice(nConc).map((s) => busyIds(s)));
+    // 停止 A 只影响 A：现在它已不是"活跃对话"，按对话停
+    nConc = admin.events['codex-status'].length;
+    const stoppedA = await ack(adminSock, 'stop-turn', { conversationId: convA.id });
+    check('stop-turn targets the given conversation', stoppedA && stoppedA.ok === true, stoppedA);
+    check('stopping conv A leaves B alone (busy list empty)',
+      await waitForNew(admin.events['codex-status'], nConc, (s) => busyIds(s).length === 0, 'idle after stopping A', 15000).then(() => true, () => false));
+    await sleep(1500); // 被杀掉的桩进程若无 taskkill，这段时间足够它把回复吐出来
+    const aReplies = admin.events['chat-message'].filter((m) => m.role === 'agent' && m.conversationId === convA.id);
+    check('stopped conversation A never replies', aReplies.length === 0, aReplies.map((m) => m.text));
+
+    /* ---- S13e 进程赖着不退出也必须收尾（turn.completed 即回合结束） ---- */
+    console.log('S13e lingering process');
+    r = await api('POST', '/api/conversations', {}, adminCookie);
+    const convL = r.json && r.json.conversation;
+    const nL = admin.events['codex-status'].length;
+    await ack(adminSock, 'chat-message', { text: 'CCX_LINGER 结论给完进程不退', conversationId: convL.id });
+    const lingerReply = await waitFor(admin.events['chat-message'], (m) => m.role === 'agent' && m.conversationId === convL.id, 'linger reply', 8000);
+    check('linger turn replies', lingerReply.text === 'LINGER-DONE', lingerReply.text);
+    check('turn ends at turn.completed, not at process exit',
+      await waitForNew(admin.events['codex-status'], nL, (s) => busyIds(s).length === 0, 'idle after linger', 5000).then(() => true, () => false));
+    const ackAfter = await ack(adminSock, 'chat-message', { text: 'PING', conversationId: convL.id });
+    check('conversation usable right after a lingering turn', ackAfter && ackAfter.ok === true, ackAfter);
+    check('next turn answered in the same conversation',
+      await waitFor(admin.events['chat-message'], (m) => m.role === 'agent' && m.conversationId === convL.id && m.text === 'RESUMED-PONG', 'reply after linger', 8000).then(() => true, () => false));
+    for (const id of [convA.id, convB.id, convL.id]) {
+      r = await api('DELETE', '/api/conversations/' + id, undefined, adminCookie);
+      check('cleanup concurrent conversation ' + id, r.status === 200, r.status);
+    }
+    await api('GET', '/api/conversations/' + conv1.id, undefined, adminCookie); // 还原活跃对话
 
     /* ---- S14 delete conversation cleans thread ---- */
     console.log('S14 delete conversation');

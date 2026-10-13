@@ -467,7 +467,16 @@ let messages = [];
 let conversations = [];  // 对话列表 [{id,title,createdAt,updatedAt,messageCount,active}]
 let activeConvId = null; // 服务端当前活跃对话
 let displayedConvId = null; // 本端正在展示的对话
-let codexBusy = false;
+let busyConvs = new Set(); // 正在回复的对话 id（服务端权威快照；各对话独立，互不阻塞）
+
+/* 加载动画只跟"本端正在看的对话"有关：别的对话在回复，这个对话照样能发消息 */
+const isBusyHere = () => !!displayedConvId && busyConvs.has(displayedConvId);
+function updateBusyUI() {
+  const b = isBusyHere();
+  $('typingRow').classList.toggle('hidden', !b);
+  $('stopBtn').classList.toggle('hidden', !b);
+}
+function setDisplayed(id) { displayedConvId = id; updateBusyUI(); }
 let serverCfg = { cwd: '', profile: 'default', model: 'default', sandbox: '', maxMessageLen: 500 };
 let processBlocks = [];  // 当前回合实时执行过程块
 let processCmdIdx = null; // 正在运行的命令块索引
@@ -654,7 +663,7 @@ async function loadConversations() {
     const data = await fetchJSON('/api/conversations', {}, 8000);
     conversations = Array.isArray(data.conversations) ? data.conversations : [];
     activeConvId = data.activeId || null;
-    if (displayedConvId === null) displayedConvId = activeConvId;
+    if (displayedConvId === null) setDisplayed(activeConvId);
     renderConvList();
   } catch (e) { /* 忽略 */ }
 }
@@ -697,7 +706,7 @@ async function newConversation() {
     }, 8000);
     if (!data.ok || !data.conversation) throw new Error('创建失败');
     activeConvId = data.conversation.id;
-    displayedConvId = data.conversation.id;
+    setDisplayed(data.conversation.id);
     conversations.unshift({
       id: data.conversation.id,
       title: data.conversation.title || '新对话',
@@ -723,7 +732,7 @@ async function switchConversation(id) {
     const data = await fetchJSON('/api/conversations/' + encodeURIComponent(id), {}, 8000);
     if (!data.ok || !data.conversation) throw new Error('切换失败');
     activeConvId = data.conversation.id;
-    displayedConvId = data.conversation.id;
+    setDisplayed(data.conversation.id);
     messages = [];
     mergeMessages(data.conversation.messages || []);
     renderChat();
@@ -792,7 +801,7 @@ function deleteConversation(id) {
       toast('对话已删除');
       await loadConversations();
       if (displayedConvId === id) {
-        displayedConvId = activeConvId;
+        setDisplayed(activeConvId);
         messages = [];
         renderChat();
         await loadActiveMessages();
@@ -842,8 +851,8 @@ document.addEventListener('click', (e) => {
 
 /* ================= 停止当前回合 ================= */
 function stopTurn() {
-  if (!codexBusy) return;
-  socket.emit('stop-turn', {}, (res) => {
+  if (!isBusyHere()) return;
+  socket.emit('stop-turn', { conversationId: displayedConvId }, (res) => {
     if (!res || !res.ok) return toast((res && res.reason) || '停止失败');
     toast(res.dropped ? '已停止，并丢弃 ' + res.dropped + ' 条排队消息' : '已停止当前回合');
   });
@@ -911,11 +920,10 @@ async function logout() {
   messages = [];
   conversations = [];
   activeConvId = null;
-  displayedConvId = null;
-  codexBusy = false;
-  $('stopBtn').classList.add('hidden');
+  setDisplayed(null);
+  busyConvs.clear();
   clearProcess();
-  $('typingRow').classList.add('hidden');
+  updateBusyUI();
   renderChat();
   socket.disconnect();
   togglePanel(null, false);
@@ -942,7 +950,7 @@ function sendChat() {
   autosize();
   scrollToBottom(true); // 发送后立即滚到底部，露出加载/过程动画
   // socket 半死（挂久了/休眠/切网）时 emit 石沉大海、ack 永不回：超时就恢复输入并重连
-  socket.timeout(15000).emit('chat-message', { text }, (err, res) => {
+  socket.timeout(15000).emit('chat-message', { text, conversationId: displayedConvId }, (err, res) => {
     if (err) {
       input.value = text;
       autosize();
@@ -1027,7 +1035,11 @@ socket.on('chat-message', (m) => {
   if (m.conversationId && m.conversationId !== displayedConvId) return;
   // 最终回复（agent）落到气泡里时，实时过程区收起：过程已经跟着回复回到气泡内（与刷新后的样子一致），
   // 否则同一批命令会在气泡和过程区各显示一遍
-  if (m.role === 'agent' || m.userId === 'codex') clearProcess();
+  if (m.role === 'agent' || m.userId === 'codex') {
+    busyConvs.delete(m.conversationId); // 结论已到，这个对话的动画立刻收（不依赖状态事件，动画绝不悬着）
+    updateBusyUI();
+    clearProcess();
+  }
   mergeMessages([m]);
   renderChat();
   hintNew();
@@ -1062,16 +1074,15 @@ socket.on('conversations', (p) => {
   activeConvId = p.activeId || null;
   renderConvList();
   if (activeConvId !== displayedConvId) {
-    displayedConvId = activeConvId;
+    setDisplayed(activeConvId);
     clearProcess(); // 切换对话后过程区归零，历史过程在消息气泡内回放
     loadActiveMessages();
   }
 });
 
 socket.on('codex-status', (p) => {
-  codexBusy = !!(p && p.busy);
-  $('typingRow').classList.toggle('hidden', !codexBusy);
-  $('stopBtn').classList.toggle('hidden', !codexBusy);
+  busyConvs = new Set((p && Array.isArray(p.conversations)) ? p.conversations : []);
+  updateBusyUI();
   // 不强制贴底：别的设备发起的回合不该把正在翻记录的人拽回底部（跟随状态下照样贴底）
   scrollToBottom(false);
   hintNew();
