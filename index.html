@@ -506,7 +506,7 @@ function renderProcessHistory(proc) {
   if (!Array.isArray(proc) || !proc.length) return '';
   return '<div class="proc-area">' + proc.map((p) => {
     if (p && p.type === 'cmd') {
-      return '<details class="proc-cmd" open><summary><span class="pc-arrow">▸</span><span class="pc-line">$ ' + esc(p.command || '') + '</span></summary>'
+      return '<details class="proc-cmd"><summary><span class="pc-arrow">▸</span><span class="pc-line">$ ' + esc(p.command || '') + '</span></summary>'
         + '<pre class="proc-out">' + esc(p.output || '') + '</pre>'
         + '<div class="proc-exit">exit code: ' + esc(p.exitCode == null ? '-' : p.exitCode) + '</div></details>';
     }
@@ -624,7 +624,7 @@ function renderProcessBlocks() {
     if (b.kind === 'cmd') {
       const running = b.running ? ' running' : '';
       const state = b.running ? '运行中' : (b.exitCode == null ? '' : 'exit ' + b.exitCode);
-      return '<details class="proc-cmd' + running + '"' + (b.open ? ' open' : '') + '><summary>'
+      return '<details class="proc-cmd' + running + '"><summary>'
         + '<span class="pc-arrow">' + (b.running ? '◌' : '▸') + '</span>'
         + '<span class="pc-line">$ ' + esc(b.command || '') + '</span>'
         + (state ? '<span class="pc-state">' + esc(state) + '</span>' : '')
@@ -1050,18 +1050,17 @@ socket.on('chat-process', (p) => {
   if (p.conversationId && p.conversationId !== displayedConvId) return;
   if (p.type === 'cmd') {
     if (p.status === 'start') {
-      addProcessBlock({ kind: 'cmd', command: p.command || '', running: true, open: true });
+      addProcessBlock({ kind: 'cmd', command: p.command || '', running: true });
     } else if (processCmdIdx != null && processBlocks[processCmdIdx]
         && processBlocks[processCmdIdx].kind === 'cmd' && processBlocks[processCmdIdx].running) {
       const b = processBlocks[processCmdIdx];
       b.running = false;
       b.output = p.output || '';
       b.exitCode = p.exitCode;
-      b.open = true;
       processCmdIdx = null;
       renderProcessBlocks();
     } else {
-      addProcessBlock({ kind: 'cmd', command: p.command || '', running: false, output: p.output || '', exitCode: p.exitCode, open: true });
+      addProcessBlock({ kind: 'cmd', command: p.command || '', running: false, output: p.output || '', exitCode: p.exitCode });
     }
   } else if (p.type === 'text' && p.text) {
     addProcessBlock({ kind: 'text', text: p.text });
