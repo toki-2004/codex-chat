@@ -104,6 +104,8 @@ const TITLE_TIMEOUT = 90000;      // 让 Codex 总结标题的单次超时
 const AGENT_USER = { userId: 'codex', name: 'Codex', color: '#10a37f' };
 const SYSTEM_USER = { userId: 'system', name: '系统', color: '#8a8f98' };
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const RUNTIME_INSTRUCTIONS =
+  '每个用户回合都由新的 codex exec / resume 进程执行。上一回合 exec_command 返回的 session_id 及其子进程不会保留；不要对上一回合的 session_id 调用 write_stdin，需要继续操作时重新执行 exec_command。';
 const NAME_RE = /^[A-Za-z0-9._\/:-]{1,100}$/;
 
 /* 把当前模型 / API 选择持久化回 config.json（只更新这几个字段，其余保持原样） */
@@ -643,6 +645,9 @@ function pushMessage(msg) {
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+const markedBrowserFile = path.join(path.dirname(require.resolve('marked/package.json')), 'lib', 'marked.umd.js');
+app.get('/vendor/marked.js', (req, res) => res.type('application/javascript').sendFile(markedBrowserFile));
+
 app.get(['/', '/index.html'], (req, res) => {
   res.sendFile(path.join(ROOT, 'index.html'));
 });
@@ -1164,6 +1169,7 @@ function buildCodexArgs(prompt, conv) {
   const base = [];
   // -p 紧跟 exec（位于 resume 之前），叠加 $CODEX_HOME/<name>.config.toml
   base.push('exec');
+  base.push('-c', 'developer_instructions=' + JSON.stringify(RUNTIME_INSTRUCTIONS));
   if (config.profile) base.push('-p', String(config.profile));
   if (conv.sessionId) {
     base.push('resume', conv.sessionId, '--json');

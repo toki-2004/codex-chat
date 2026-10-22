@@ -6,10 +6,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/e2e.js"
+    "test": "node test/e2e.js && node test/markdown.js"
   },
   "dependencies": {
     "express": "^5.2.1",
+    "marked": "^18.1.1",
     "socket.io": "^4.8.3"
   },
   "devDependencies": {

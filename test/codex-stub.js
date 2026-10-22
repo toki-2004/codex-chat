@@ -48,14 +48,14 @@ if (args[0] !== 'exec') {
   process.exit(2);
 }
 
-// Parse: exec [--json] [-p profile] [-C dir] [-m model] [-s sandbox] [resume <id>] [flags] <prompt>
+// Parse: exec [--json] [-c key=value] [-p profile] [-C dir] [-m model] [-s sandbox] [resume <id>] [flags] <prompt>
 let isResume = false;
 let threadId = null;
 let prompt = '';
 for (let i = 1; i < args.length; i++) {
   const a = args[i];
   if (a === 'resume') { isResume = true; threadId = args[i + 1]; i++; }
-  else if (a === '-p' || a === '-C' || a === '-m' || a === '-s') { i++; }
+  else if (a === '-c' || a === '-p' || a === '-C' || a === '-m' || a === '-s') { i++; }
   else if (a.startsWith('-')) { /* flag, no value */ }
   else { prompt = a; } // prompt is the final positional argument
 }
@@ -79,7 +79,7 @@ const reply = (() => {
   if (prompt.indexOf('PING') >= 0) return isResume ? 'RESUMED-PONG' : 'PONG';
   if (prompt.indexOf('CCX_SLOW') >= 0) return 'SLOW-DONE';
   if (prompt.indexOf('CCX_LINGER') >= 0) return 'LINGER-DONE';
-  if (prompt.indexOf('CCX_MD') >= 0) return '**粗体**\n\n```js\nconsole.log(1);\n```\n\n结束';
+  if (prompt.indexOf('CCX_MD') >= 0) return '# 标题\n\n**粗体**\n\n- 第一项\n- 第二项\n\n| 列 A | 列 B |\n| --- | --- |\n| 1 | 2 |\n\n```js\nconsole.log(1);\n```\n\n结束';
   return 'STUB-REPLY ' + String(prompt).slice(-30);
 })();
 

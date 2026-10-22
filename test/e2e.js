@@ -391,6 +391,11 @@ function stopServer(proc) {
     check('resume reply received', !!resumeMsg);
     const stubCalls = fs.readFileSync(stubLog, 'utf8');
     check('stub was called with resume + thread id', stubCalls.indexOf('"resume","' + thread1 + '"') >= 0, stubCalls.slice(-300));
+    const execCallLines = stubCalls.split('\n')
+      .filter((l) => l.startsWith('CALL ') && l.indexOf('"exec"') >= 0);
+    check('each turn carries cross-turn process guidance',
+      execCallLines.length >= 3 && execCallLines.every((l) => l.indexOf('上一回合 exec_command') >= 0),
+      execCallLines);
     const convsFile2 = JSON.parse(fs.readFileSync(path.join(dataDir, 'conversations.json'), 'utf8'));
     const conv1b = convsFile2.conversations.find((c) => c.id === conv1.id);
     check('thread id unchanged across resume', conv1b.sessionId === thread1, conv1b.sessionId);
